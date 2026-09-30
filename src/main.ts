@@ -27,64 +27,94 @@ function bindInput(inputId:string,cardId:string,metaId:string,assign:(f:File)=>v
   card.addEventListener('drop',e=>{e.preventDefault();card.classList.remove('drag');const f=e.dataTransfer?.files?.[0];if(!f)return;assign(f);showFile(inputId==='leadFile'?'lead':'backing',f);card.classList.remove('good','bad');passed=false;setGate('wait',lead&&backing?'Both stems loaded. Analyze them to continue.':'Waiting for both files.');$('generate').setAttribute('disabled','true');});
 }
 
-function fftLike(samples:Float32Array,sampleRate:number):Pick<AudioStats,'rms'|'zcr'|'centroid'|'flatness'|'lowRatio'|'harmonicity'>{
-  // Use real frequency-domain measurements. The previous prototype accidentally
-  // treated sample indexes as frequencies, which made legitimate vocal stems
-  // score incorrectly.
-  const n=Math.min(samples.length,2048);
-  let rms=0,zcr=0;
+function fftLike(samples:Float32Array,sampleRate:number,maxFft=2048):Pick<AudioStats,'rms'|'zcr'|'centroid'|'flatness'|'lowRatio'|'harmonicity'>{
+  // Radix-2 FFT: replaces the old O(N²) DFT with O(N log N) work.
+  const limit=Math.min(samples.length,maxFft);
+  const n=Math.max(64,1<<Math.floor(Math.log2(Math.max(64,limit))));
+  const re=new Float32Array(n);
+  const im=new Float32Array(n);
+  let rms=0;
+  let zcr=0;
+
   for(let i=0;i<n;i++){
     const x=samples[i]??0;
+    const window=.5*(1-Math.cos(2*Math.PI*i/Math.max(1,n-1)));
+    re[i]=x*window;
     rms+=x*x;
     if(i>0&&((samples[i-1]??0)>=0)!=(x>=0))zcr++;
   }
   rms=Math.sqrt(rms/Math.max(1,n));
   zcr/=Math.max(1,n);
 
-  const bins=Math.floor(n/2);
-  let total=0,weighted=0,logSum=0,low=0;
-  const mags=new Float64Array(bins);
-  for(let k=0;k<bins;k++){
-    let re=0,im=0;
-    const freq=k*sampleRate/n;
-    for(let i=0;i<n;i++){
-      const x=samples[i]??0;
-      const window=.5*(1-Math.cos(2*Math.PI*i/Math.max(1,n-1)));
-      const phase=2*Math.PI*k*i/n;
-      re+=x*window*Math.cos(phase);
-      im-=x*window*Math.sin(phase);
+  for(let i=1,j=0;i<n;i++){
+    let bit=n>>1;
+    for(;j&bit;bit>>=1)j^=bit;
+    j^=bit;
+    if(i<j){
+      const tr=re[i];re[i]=re[j];re[j]=tr;
+      const ti=im[i];im[i]=im[j];im[j]=ti;
     }
-    const mag=Math.hypot(re,im);
-    mags[k]=mag;
+  }
+
+  for(let size=2;size<=n;size<<=1){
+    const half=size>>1;
+    const step=-2*Math.PI/size;
+    for(let start=0;start<n;start+=size){
+      for(let j=0;j<half;j++){
+        const angle=step*j;
+        const wr=Math.cos(angle);
+        const wi=Math.sin(angle);
+        const i=start+j;
+        const k=i+half;
+        const tr=wr*re[k]-wi*im[k];
+        const ti=wr*im[k]+wi*re[k];
+        re[k]=re[i]-tr;
+        im[k]=im[i]-ti;
+        re[i]+=tr;
+        im[i]+=ti;
+      }
+    }
+  }
+
+  const bins=n>>1;
+  let total=0;
+  let weighted=0;
+  let low=0;
+  let logSum=0;
+  for(let k=0;k<bins;k++){
+    const freq=k*sampleRate/n;
+    const mag=Math.hypot(re[k],im[k]);
     total+=mag;
     weighted+=freq*mag;
     if(freq<=300)low+=mag;
     logSum+=Math.log(mag+1e-12);
   }
-  const centroid=total?Math.min(1,weighted/total/(sampleRate/2)):0;
+
+  const nyquist=Math.max(1,sampleRate/2);
+  const centroid=total?Math.min(1,weighted/total/nyquist):0;
   const arith=total/Math.max(1,bins)+1e-12;
   const geo=Math.exp(logSum/Math.max(1,bins));
   const flatness=Math.max(0,Math.min(1,geo/arith));
   const lowRatio=total?low/total:0;
 
-  // Normalized autocorrelation gives a lightweight periodicity/harmonicity
-  // signal that works much better for sung voice than peak/RMS.
   let harmonicity=0;
   const minLag=Math.max(2,Math.floor(sampleRate/500));
   const maxLag=Math.min(Math.floor(sampleRate/70),Math.floor(n/2));
-  let energy=0;
-  for(let i=0;i<n;i++){const x=samples[i]??0;energy+=x*x;}
-  if(energy>1e-8&&maxLag>minLag){
-    for(let lag=minLag;lag<=maxLag;lag+=2){
+  if(rms>1e-4&&maxLag>minLag){
+    for(let lag=minLag;lag<=maxLag;lag+=4){
       let corr=0,ea=0,eb=0;
       for(let i=0;i<n-lag;i++){
-        const a=samples[i]??0,b=samples[i+lag]??0;
-        corr+=a*b;ea+=a*a;eb+=b*b;
+        const a=samples[i]??0;
+        const b=samples[i+lag]??0;
+        corr+=a*b;
+        ea+=a*a;
+        eb+=b*b;
       }
       const normalized=corr/Math.sqrt((ea+1e-12)*(eb+1e-12));
       harmonicity=Math.max(harmonicity,Math.max(0,normalized));
     }
   }
+
   return {rms,zcr,centroid,flatness,lowRatio,harmonicity};
 }
 
