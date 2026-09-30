@@ -526,40 +526,67 @@ function toTime(ms:number){
   const millis=safeMs%1000;
   return String(hours).padStart(2,'0')+':'+String(minutes).padStart(2,'0')+':'+String(seconds).padStart(2,'0')+'.'+String(millis).padStart(3,'0');
 }
-function makeTtml(onProgress:(value:number,label:string,detail:string)=>void=()=>{}){
+function makeDocumentHead(title:string,artist:string,lang:string,autoV2:boolean):string{
+  return '<?xml version="1.0" encoding="UTF-8"?>\n<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata" xmlns:itunes="http://music.apple.com/lyric-ttml-internal" xml:lang="'+lang+'" itunes:timing="Word">\n  <head>\n    <metadata>\n      <ttm:title>'+title+'</ttm:title>\n      <ttm:agent type="person" xml:id="v1"><ttm:name type="full">'+artist+'</ttm:name></ttm:agent>'+(autoV2?'\n      <ttm:agent type="person" xml:id="v2"><ttm:name type="full">Secondary Voice</ttm:name></ttm:agent>':'')+'\n    </metadata>\n  </head>\n  <body>\n    <div itunes:song-part="Verse">\n';
+}
+function makeDocumentTail():string{return '    </div>\n  </body>\n</tt>';}
+
+function renderLine(line:LyricLineUnit,index:number,secondaryIntervals:AudioInterval[],backingIntervals:AudioInterval[],autoV2:boolean,autoBg:boolean):string{
+  const agent=lineAgent(line,secondaryIntervals,autoV2);
+  const main=renderSyllables(line.syllables);
+  let bg='';
+  if(autoBg){
+    const overlaps=backingIntervals.filter(x=>overlapSeconds(x,{start:line.begin/1000,end:line.end/1000})>.025);
+    if(overlaps.length){
+      const bgStart=Math.max(line.begin,Math.min(line.end,Math.min(...overlaps.map(x=>x.start*1000))));
+      const bgEnd=Math.max(bgStart,Math.min(line.end,Math.max(...overlaps.map(x=>x.end*1000))));
+      const bgUnits=line.syllables.filter(u=>overlapWithIntervals(u.begin/1000,u.end/1000,overlaps)>.02);
+      if(bgUnits.length&&bgEnd>bgStart)bg='\n        <span ttm:role="x-bg" begin="'+toTime(bgStart)+'" end="'+toTime(bgEnd)+'">'+renderSyllables(bgUnits)+'</span>';
+    }
+  }
+  return '      <p begin="'+toTime(line.begin)+'" end="'+toTime(line.end)+'" itunes:key="L'+(index+1)+'" ttm:agent="'+agent+'">\n        '+main+bg+'\n      </p>';
+}
+
+async function makeTtml(onProgress:(value:number,label:string,detail:string)=>void=()=>{}){
   const title=escapeHtml(decodeCommonEntities(($('title') as HTMLInputElement).value||'Untitled Session'));
   const artist=escapeHtml(decodeCommonEntities(($('artist') as HTMLInputElement).value||'Unknown Artist'));
-  const lang=($('lang') as HTMLSelectElement).value; const lines=getLyricLines();
-  const durationMs=Math.max(1000,(backing?.stats?.duration??lead?.stats?.duration??4)*1000);
-  const leadIntervals=normalizeIntervals(lead?.stats?.vocalIntervals??[],durationMs/1000,.18);
-  const secondaryIntervals=normalizeIntervals(lead?.stats?.secondaryIntervals??[],durationMs/1000,.18);
-  const backingIntervals=normalizeIntervals(backing?.stats?.vocalIntervals??[],durationMs/1000,.18);
+  const lang=($('lang') as HTMLSelectElement).value;
+  const lines=getLyricLines();
+  if(!lines.length)throw new Error('Enter at least one lyric line before generating.');
+  if(!lead?.stats||!backing?.stats)throw new Error('Analyze both stems before generating.');
+
+  const durationMs=Math.max(1000,Math.max(lead.stats.duration,backing.stats.duration)*1000);
+  const leadIntervals=normalizeIntervals(lead.stats.vocalIntervals,durationMs/1000,.10);
+  const secondaryIntervals=normalizeIntervals(lead.stats.secondaryIntervals,durationMs/1000,.10);
+  const backingIntervals=normalizeIntervals(backing.stats.vocalIntervals,durationMs/1000,.10);
   const secondaryCoverage=secondaryIntervals.reduce((n,x)=>n+Math.max(0,x.end-x.start),0);
-  const v2Detected=(lead?.stats?.secondaryVoicePeak??0)>=.62&&secondaryIntervals.length>0&&secondaryCoverage>=.08;
-  const bgDetected=(backing?.stats?.vocalCoverage??0)>=.045&&(backing?.stats?.vocalActivity??0)>=.44&&backingIntervals.length>0&&(backing?.score??0)>=.60;
-  const allowV2=qs<HTMLButtonElement>('[data-toggle="v2"]').classList.contains('on'); const allowBg=qs<HTMLButtonElement>('[data-toggle="bg"]').classList.contains('on');
-  const autoV2=v2Detected&&allowV2; const autoBg=bgDetected&&allowBg;
-  onProgress(24,'Mapping lyric lines','Keeping every Enter-separated lyric line as its own timing unit.');
-  const lineUnits=buildLyricLineTimeline(lines,durationMs,lang,leadIntervals);
-  onProgress(52,'Building syllable timing','Breaking the supplied lines into syllables and distributing timing across analyzed vocal activity.');
-  const outputLines=lineUnits.map((line,i)=>{
-    const agent=lineAgent(line,secondaryIntervals,autoV2);
-    const main=renderSyllables(line.syllables);
-    const lineBacking=autoBg?splitIntervalsForLine(line.begin,line.end,backingIntervals):[];
-    let bg='';
-    if(lineBacking.length){
-      const bgSyllables=line.syllables.filter(u=>overlapWithIntervals(u.begin/1000,u.end/1000,lineBacking)>.015);
-      if(bgSyllables.length){
-        const bgStart=Math.max(0,Math.min(durationMs,Math.min(...bgSyllables.map(x=>x.begin))));
-        const bgEnd=Math.max(bgStart,Math.min(durationMs,Math.max(...bgSyllables.map(x=>x.end))));
-        if(bgEnd>bgStart)bg='\n        <span ttm:role="x-bg" begin="'+toTime(bgStart)+'" end="'+toTime(bgEnd)+'">'+renderSyllables(bgSyllables)+'</span>';
-      }
-    }
-    return '      <p begin="'+toTime(line.begin)+'" end="'+toTime(line.end)+'" itunes:key="L'+(i+1)+'" ttm:agent="'+agent+'">\n        '+main+bg+'\n      </p>';
-  }).join('\n');
-  onProgress(78,'Assembling TTML','Adding automatic V2 agent metadata and BG placements only when detected.');
-  if(/00:-|:-\d|--/.test(outputLines))throw new Error('Internal timing guard rejected a negative or malformed lyric timestamp.');
-  return '<?xml version="1.0" encoding="UTF-8"?>\n<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata" xmlns:itunes="http://music.apple.com/lyric-ttml-internal" xml:lang="'+lang+'" itunes:timing="Word">\n  <head>\n    <metadata>\n      <ttm:title>'+title+'</ttm:title>\n      <ttm:agent type="person" xml:id="v1"><ttm:name type="full">'+artist+'</ttm:name></ttm:agent>'+(autoV2?'\n      <ttm:agent type="person" xml:id="v2"><ttm:name type="full">Secondary Voice</ttm:name></ttm:agent>':'')+'\n    </metadata>\n  </head>\n  <body>\n    <div itunes:song-part="Verse">\n'+outputLines+'\n    </div>\n  </body>\n</tt>';
+  const v2Detected=(lead.stats.secondaryVoicePeak??0)>=.62&&secondaryIntervals.length>0&&secondaryCoverage>=.08;
+  const bgDetected=(backing.stats.vocalCoverage??0)>=.045&&(backing.stats.vocalActivity??0)>=.44&&backingIntervals.length>0&&(backing.score??0)>=.60;
+  const allowV2=qs<HTMLButtonElement>('[data-toggle="v2"]').classList.contains('on');
+  const allowBg=qs<HTMLButtonElement>('[data-toggle="bg"]').classList.contains('on');
+  const autoV2=v2Detected&&allowV2;
+  const autoBg=bgDetected&&allowBg;
+
+  onProgress(10,'Reading lyric lines','The textbox is the source transcript; every Enter is a separate alignment target.');
+  await yieldToUi();
+  onProgress(20,'Using actual lead-vocal timing','Scanning real vocal intervals and local audio peaks for phrase and syllable anchors.');
+  const lineUnits=buildLyricLineTimeline(lines,durationMs,lang,leadIntervals,lead.stats.syllablePeaks);
+  await yieldToUi();
+
+  let partial=makeDocumentHead(title,artist,lang,autoV2);
+  $('xml').textContent=partial+makeDocumentTail();
+  for(let i=0;i<lineUnits.length;i++){
+    partial+=renderLine(lineUnits[i],i,secondaryIntervals,backingIntervals,autoV2,autoBg)+'\n';
+    const pct=24+(i+1)/lineUnits.length*68;
+    onProgress(pct,'Developing TTML line '+(i+1)+' / '+lineUnits.length,'Writing the completed line from real audio-derived timing anchors.');
+    $('xml').textContent=partial+makeDocumentTail();
+    await yieldToUi();
+  }
+  onProgress(94,'Detecting backing-vocal placements','Using the independent backing-stem vocal envelope for BG spans.');
+  await yieldToUi();
+  const xml=partial+makeDocumentTail();
+  if(/00:-|:-\d|--/.test(xml))throw new Error('Internal timing guard rejected a negative or malformed lyric timestamp.');
+  return xml;
 }
 function parseTtmlTime(value:string|null):number{
   if(!value||!/^(?:\d+):[0-5]\d:[0-5]\d\.\d{3}$/.test(value))return NaN;
@@ -602,6 +629,6 @@ $('lyrics').addEventListener('input',updateLyricsStats);
 $('lang').addEventListener('change',updateLyricsStats);
 updateLyricsStats();
 
-$('generate').addEventListener('click',async()=>{if(!passed)return; if(!settings.cpu){setGate('bad','CPU analysis is disabled for the current DSP implementation.');return;} $('generate').setAttribute('disabled','true'); setProgress(0,'Generating TTML','Using the analyzed vocal envelope and the exact lyric lines from the textbox.'); try{output=makeTtml((value,label,detail)=>{log('run: '+label+'…');setProgress(value,label,detail);});setProgress(88,'Validating TTML','Checking XML, timestamp format, line ordering and nested BG spans.');validateTtml(output);$('xml').textContent=output;const lineCount=(output.match(/itunes:key="L\d+"/g)||[]).length;const syllableCount=(output.match(/<span begin=/g)||[]).length;setProgress(100,'TTML ready',lineCount+' lyric lines • '+syllableCount+' timed syllables • automatic BG/v2 applied from analysis.');const base=(($('title') as HTMLInputElement).value||'session').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'session';$('fileName').textContent=base+'.ttml';$('download').removeAttribute('disabled');log('complete: TTML ready • '+lineCount+' lines • '+syllableCount+' timed syllables');$('result').scrollIntoView({behavior:'smooth'});}catch(err){setGate('bad',err instanceof Error?err.message:'TTML generation failed.');log('generation: ERROR');} $('generate').removeAttribute('disabled');});
+$('generate').addEventListener('click',async()=>{if(!passed)return; if(!settings.cpu){setGate('bad','CPU analysis is disabled for the current DSP implementation.');return;} $('generate').setAttribute('disabled','true'); setProgress(0,'Generating TTML','Using the analyzed vocal envelope and the exact lyric lines from the textbox.'); try{output=await makeTtml((value,label,detail)=>{log('run: '+label+'…');setProgress(value,label,detail);});setProgress(88,'Validating TTML','Checking XML, timestamp format, line ordering and nested BG spans.');validateTtml(output);$('xml').textContent=output;const lineCount=(output.match(/itunes:key="L\d+"/g)||[]).length;const syllableCount=(output.match(/<span begin=/g)||[]).length;setProgress(100,'TTML ready',lineCount+' lyric lines • '+syllableCount+' timed syllables • automatic BG/v2 applied from analysis.');const base=(($('title') as HTMLInputElement).value||'session').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'session';$('fileName').textContent=base+'.ttml';$('download').removeAttribute('disabled');log('complete: TTML ready • '+lineCount+' lines • '+syllableCount+' timed syllables');$('result').scrollIntoView({behavior:'smooth'});}catch(err){setGate('bad',err instanceof Error?err.message:'TTML generation failed.');log('generation: ERROR');} $('generate').removeAttribute('disabled');});
 $('copy').addEventListener('click',async()=>{if(!output)return;try{await navigator.clipboard.writeText(output);$('copy').textContent='Copied';}catch{log('copy: clipboard permission unavailable');}});
 $('download').addEventListener('click',()=>{if(!output)return;const blob=new Blob([output],{type:'application/ttml+xml;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=$('fileName').textContent??'session.ttml';a.click();setTimeout(()=>URL.revokeObjectURL(url),500);});
