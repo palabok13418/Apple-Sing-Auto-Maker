@@ -503,6 +503,22 @@ function validateTtml(xml:string){
     }
   });
 }
+function updateLyricsStats(){
+  const raw=(($('lyrics') as HTMLInputElement).value||'').replace(/\r\n?/g,'\n');
+  const lines=raw.split('\n').filter(line=>line.trim().length>0);
+  const lang=($('lang') as HTMLSelectElement).value;
+  let words=0; let syllables=0;
+  for(const line of lines){
+    const ws=splitWords(decodeCommonEntities(line));
+    words+=ws.length;
+    syllables+=ws.reduce((n,w)=>n+splitSyllables(w,lang).length,0);
+  }
+  $('lyricsStats').textContent=lines.length+' lyric lines · '+words+' words · '+syllables+' syllable units';
+}
+$('lyrics').addEventListener('input',updateLyricsStats);
+$('lang').addEventListener('change',updateLyricsStats);
+updateLyricsStats();
+
 $('generate').addEventListener('click',async()=>{if(!passed)return; if(!settings.cpu){setGate('bad','CPU analysis is disabled for the current DSP implementation.');return;} $('generate').setAttribute('disabled','true'); setProgress(0,'Generating TTML','Using the analyzed vocal envelope and the exact lyric lines from the textbox.'); try{output=makeTtml((value,label,detail)=>{log('run: '+label+'…');setProgress(value,label,detail);});setProgress(88,'Validating TTML','Checking XML, timestamp format, line ordering and nested BG spans.');validateTtml(output);$('xml').textContent=output;const lineCount=(output.match(/itunes:key="L\d+"/g)||[]).length;const syllableCount=(output.match(/<span begin=/g)||[]).length;setProgress(100,'TTML ready',lineCount+' lyric lines • '+syllableCount+' timed syllables • automatic BG/v2 applied from analysis.');const base=(($('title') as HTMLInputElement).value||'session').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'session';$('fileName').textContent=base+'.ttml';$('download').removeAttribute('disabled');log('complete: TTML ready • '+lineCount+' lines • '+syllableCount+' timed syllables');$('result').scrollIntoView({behavior:'smooth'});}catch(err){setGate('bad',err instanceof Error?err.message:'TTML generation failed.');log('generation: ERROR');} $('generate').removeAttribute('disabled');});
 $('copy').addEventListener('click',async()=>{if(!output)return;try{await navigator.clipboard.writeText(output);$('copy').textContent='Copied';}catch{log('copy: clipboard permission unavailable');}});
 $('download').addEventListener('click',()=>{if(!output)return;const blob=new Blob([output],{type:'application/ttml+xml;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=$('fileName').textContent??'session.ttml';a.click();setTimeout(()=>URL.revokeObjectURL(url),500);});
