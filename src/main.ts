@@ -271,65 +271,87 @@ function overlapSeconds(a:AudioInterval,b:{start:number;end:number}):number{retu
 function overlapWithIntervals(start:number,end:number,intervals:AudioInterval[]):number{return intervals.reduce((sum,x)=>sum+overlapSeconds(x,{start,end}),0);}
 function activeTimelineMap(activeMs:number,intervals:AudioInterval[],durationMs:number):number{
   const safeDuration=Math.max(0,Number.isFinite(durationMs)?durationMs:0);
-  const remainingMs=Math.max(0,Number.isFinite(activeMs)?activeMs:0);
+  const target=Math.max(0,Number.isFinite(activeMs)?activeMs:0);
   if(!safeDuration)return 0;
-  if(!intervals.length)return Math.min(safeDuration,remainingMs);
-  let remaining=remainingMs;
+  if(!intervals.length)return Math.min(safeDuration,target);
+  let remaining=target;
   for(const x of intervals){
-    const a=Math.max(0,Math.min(safeDuration,x.start*1000));
-    const b=Math.max(a,Math.min(safeDuration,x.end*1000));
-    const len=Math.max(0,b-a);
-    if(remaining<=len)return Math.max(0,Math.min(safeDuration,a+remaining));
-    remaining-=len;
+    const begin=Math.max(0,Math.min(safeDuration,x.start*1000));
+    const end=Math.max(begin,Math.min(safeDuration,x.end*1000));
+    const span=end-begin;
+    if(remaining<=span)return begin+remaining;
+    remaining-=span;
   }
   return safeDuration;
 }
-function buildLyricLineTimeline(lines:string[],durationMs:number,lang:string,intervals:AudioInterval[]):LyricLineUnit[]{
-  const safeDuration=Math.max(1000,Math.floor(Number.isFinite(durationMs)?durationMs:1000));
-  const safeIntervals=normalizeIntervals(intervals,safeDuration/1000,.12);
-  const weights=lines.map(line=>{
-    const words=splitWords(line);
-    return Math.max(1,words.reduce((n,w)=>n+splitSyllables(w,lang).reduce((m,s)=>m+syllableWeight(s),0),0));
-  });
+function nearestPeak(peaks:AudioPeak[],targetMs:number,fromIndex=0,minMs=0):{index:number;timeMs:number;strength:number}|null{
+  let best:null|{index:number;timeMs:number;strength:number}=null;
+  for(let i=Math.max(0,fromIndex);i<peaks.length;i++){
+    const timeMs=peaks[i].time*1000;
+    if(timeMs<minMs)continue;
+    const candidate={index:i,timeMs,strength:peaks[i].strength};
+    if(!best||Math.abs(candidate.timeMs-targetMs)<Math.abs(best.timeMs-targetMs))best=candidate;
+    if(candidate.timeMs>targetMs+850)break;
+  }
+  return best;
+}
+function findPhraseBoundary(intervals:AudioInterval[],targetMs:number,minMs:number,maxMs:number):number{
+  const points:number[]=[];
+  for(const x of intervals){
+    const start=x.start*1000,end=x.end*1000;
+    if(end<minMs-600||start>maxMs+600)continue;
+    points.push(Math.max(minMs,Math.min(maxMs,start)));
+    points.push(Math.max(minMs,Math.min(maxMs,end)));
+  }
+  if(!points.length)return Math.max(minMs,Math.min(maxMs,targetMs));
+  return points.reduce((best,x)=>Math.abs(x-targetMs)<Math.abs(best-targetMs)?x:best,points[0]);
+}
+function buildLyricLineTimeline(lines:string[],durationMs:number,lang:string,intervals:AudioInterval[],peaks:AudioPeak[]):LyricLineUnit[]{
+  const duration=Math.max(1000,Math.floor(Number.isFinite(durationMs)?durationMs:1000));
+  const safeIntervals=normalizeIntervals(intervals,duration/1000,.10);
+  const safePeaks=peaks.filter(p=>Number.isFinite(p.time)&&p.time>=0&&p.time<=duration/1000).sort((x,y)=>x.time-y.time);
+  const weights=lines.map(line=>Math.max(1,splitWords(line).reduce((n,w)=>n+splitSyllables(w,lang).length,0)));
   const totalWeight=weights.reduce((a,b)=>a+b,0)||1;
-  const activeMs=safeIntervals.reduce((n,x)=>n+Math.max(0,x.end-x.start)*1000,0);
-  const usableMs=activeMs>100?activeMs:safeDuration;
+  const activeMs=safeIntervals.reduce((n,x)=>n+(x.end-x.start)*1000,0);
   let activeCursor=0;
+  let lastEnd=0;
   return lines.map((line,i)=>{
     const lineActiveStart=activeCursor;
-    const lineActiveEnd=Math.min(usableMs,lineActiveStart+usableMs*weights[i]/totalWeight);
-    activeCursor=lineActiveEnd;
-    const lineStart=Math.max(0,Math.min(safeDuration,activeTimelineMap(lineActiveStart,safeIntervals,safeDuration)));
-    let lineEnd=Math.max(lineStart,Math.min(safeDuration,activeTimelineMap(lineActiveEnd,safeIntervals,safeDuration)));
-    if(lineEnd<=lineStart){
-      lineEnd=Math.min(safeDuration,lineStart+Math.max(40,Math.min(150,safeDuration-lineStart)));
-    }
+    const lineActiveEnd=Math.min(activeMs,lineActiveStart+(activeMs>100?activeMs*weights[i]/totalWeight:duration*weights[i]/totalWeight));
+    const rawStart=activeMs>100?activeTimelineMap(lineActiveStart,safeIntervals,duration):duration*lineActiveStart/duration;
+    const rawEnd=activeMs>100?activeTimelineMap(lineActiveEnd,safeIntervals,duration):duration*lineActiveEnd/duration;
+    let lineStart=Math.max(lastEnd,Math.min(duration,findPhraseBoundary(safeIntervals,rawStart,lastEnd,Math.max(rawStart,rawEnd))*1));
+    let lineEnd=Math.min(duration,Math.max(lineStart+60,findPhraseBoundary(safeIntervals,rawEnd,lineStart,Math.min(duration,rawEnd+700))));
+    if(lineEnd<=lineStart)lineEnd=Math.min(duration,lineStart+Math.max(80,rawEnd-rawStart));
 
-    const words=splitWords(line);
-    const entries=words.flatMap((word,wi)=>splitSyllables(word,lang).map(text=>({text,wordIndex:wi,weight:syllableWeight(text)})));
-    const sum=entries.reduce((n,x)=>n+x.weight,0)||1;
+    const entries=splitWords(line).flatMap((word,wi)=>splitSyllables(word,lang).map(text=>({text,wordIndex:wi})));
     const syllables:SyllableUnit[]=[];
-    let syllableCursor=lineActiveStart;
+    const localPeaks=safePeaks.filter(p=>p.time*1000>=lineStart-100&&p.time*1000<=lineEnd+120);
+    let peakIndex=0;
+    let cursor=lineStart;
+    const idealStep=(lineEnd-lineStart)/Math.max(1,entries.length);
     for(let j=0;j<entries.length;j++){
-      const x=entries[j];
-      const nextActive=j===entries.length-1?lineActiveEnd:Math.min(lineActiveEnd,syllableCursor+(lineActiveEnd-lineActiveStart)*x.weight/sum);
-      const sb=Math.max(lineStart,Math.min(lineEnd,activeTimelineMap(syllableCursor,safeIntervals,safeDuration)));
-      let se=Math.max(sb,Math.min(lineEnd,activeTimelineMap(nextActive,safeIntervals,safeDuration)));
-      if(se<=sb)se=Math.min(lineEnd,sb+Math.max(1,Math.min(40,lineEnd-sb)));
-      syllables.push({text:x.text,begin:Math.max(0,sb),end:Math.max(sb,se),wordIndex:x.wordIndex});
-      syllableCursor=nextActive;
-    }
+      const nominalStart=lineStart+j*idealStep;
+      const foundStart=localPeaks.length?nearestPeak(localPeaks,nominalStart,j===0?0:peakIndex,cursor):null;
+      let begin=j===0?lineStart:Math.max(cursor,foundStart?foundStart.timeMs-28:nominalStart);
+      if(j>0&&begin-cursor<24)begin=Math.min(lineEnd-25,cursor+Math.max(24,idealStep*.30));
 
-    if(syllables.length){
-      syllables[0].begin=Math.max(lineStart,Math.min(lineEnd,syllables[0].begin));
-      for(let j=1;j<syllables.length;j++){
-        syllables[j].begin=Math.max(syllables[j].begin,syllables[j-1].begin);
-      }
-      for(let j=0;j<syllables.length-1;j++){
-        syllables[j].end=Math.max(syllables[j].begin,Math.min(lineEnd,syllables[j+1].begin));
-      }
-      syllables[syllables.length-1].end=Math.max(syllables[syllables.length-1].begin,Math.min(lineEnd,lineEnd));
+      const nominalEnd=j===entries.length-1?lineEnd:lineStart+(j+1)*idealStep;
+      const foundEnd=localPeaks.length?nearestPeak(localPeaks,nominalEnd,foundStart?foundStart.index+1:peakIndex+1,begin):null;
+      let end=j===entries.length-1?lineEnd:(foundEnd?foundEnd.timeMs-16:nominalEnd);
+      end=Math.min(lineEnd,Math.max(begin+22,end));
+      syllables.push({text:entries[j].text,begin:Math.max(lineStart,Math.min(lineEnd,begin)),end:Math.max(begin,Math.min(lineEnd,end)),wordIndex:entries[j].wordIndex});
+      cursor=syllables[syllables.length-1].end;
+      peakIndex=foundEnd?foundEnd.index:(foundStart?foundStart.index:peakIndex);
     }
+    if(syllables.length){
+      syllables[0].begin=lineStart;
+      for(let j=1;j<syllables.length;j++)syllables[j].begin=Math.max(syllables[j].begin,syllables[j-1].end-10);
+      for(let j=0;j<syllables.length-1;j++)syllables[j].end=Math.max(syllables[j].begin+20,Math.min(lineEnd,syllables[j+1].begin));
+      syllables[syllables.length-1].end=Math.max(syllables[syllables.length-1].begin,lineEnd);
+    }
+    lastEnd=lineEnd;
+    activeCursor=lineActiveEnd;
     return {text:line,begin:lineStart,end:lineEnd,syllables};
   });
 }
