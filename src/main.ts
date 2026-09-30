@@ -138,7 +138,16 @@ function splitSyllables(word:string,lang:string):string[]{
   if(/^ko(?:-|$)/u.test(lang)||/^zh(?:-|$)/u.test(lang))return graphemes;
   const leading=(word.match(/^[^\p{L}\p{N}]*/u)?.[0]??''); const trailing=(word.match(/[^\p{L}\p{N}]*$/u)?.[0]??''); const core=word.slice(leading.length,Math.max(leading.length,word.length-trailing.length));
   if(!core)return [word];
-  const groups=core.match(/[^aeiouy]*[aeiouy]+(?:[^aeiouy](?=[^aeiouy]+)|$)/giu)??[core]; const syllables=groups.filter(Boolean); if(!syllables.length)return [word];
+  const nuclei:Array<{start:number;end:number}>=[]; const re=/[aeiouy]+/giu; let m:RegExpExecArray|null;
+  while((m=re.exec(core))!==null)nuclei.push({start:m.index,end:m.index+m[0].length});
+  if(!nuclei.length)return [word];
+  const syllables:string[]=[]; let start=0;
+  for(let i=0;i<nuclei.length-1;i++){
+    const cluster=core.slice(nuclei[i].end,nuclei[i+1].start);
+    const boundary=nuclei[i].end+Math.floor(Math.max(0,cluster.length-1)/2);
+    syllables.push(core.slice(start,boundary)); start=boundary;
+  }
+  syllables.push(core.slice(start));
   syllables[0]=leading+syllables[0]; syllables[syllables.length-1]+=trailing; return syllables;
 }
 type SyllableUnit={text:string;begin:number;end:number;wordIndex:number};
