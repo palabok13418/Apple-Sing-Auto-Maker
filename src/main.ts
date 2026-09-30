@@ -230,73 +230,31 @@ async function getAlignmentPipeline():Promise<any>{
     configureAlignmentRuntime(mod,useGpu,gpuAdapter);
     return mod.pipeline('automatic-speech-recognition','onnx-community/whisper-tiny',{
       device:useGpu?'webgpu':'wasm',
+      // Whisper Tiny publishes matching fp16 encoder/merged-decoder ONNX weights.
       dtype:useGpu?{encoder_model:'fp32',decoder_model_merged:'q4'}:'q8',
+      // ORT's node-placement warnings are not actionable for this workload.
+      // Severity 3 keeps actual errors while hiding warning-level placement logs.
       session_options:{logSeverityLevel:3}
     });
   })();
   return alignmentPipelinePromise;
 }
-
-function normalizeTranscriptWord(text:string):string{
-  return String(text||'').normalize('NFKD').toLowerCase().replace(/\p{M}/gu,'').replace(/[^\p{L}\p{N}]+/gu,'');
-}
-
-async function transcribeLongAudio(pipe:any,waveform:Float32Array,language:string|undefined,onProgress:(value:number)=>void):Promise<TimedWord[]>{
-  const SAMPLE_RATE=16000;
-  const CHUNK_SECONDS=27;
-  const OVERLAP_SECONDS=3;
-  const STEP_SECONDS=CHUNK_SECONDS-OVERLAP_SECONDS;
-  const chunkSize=CHUNK_SECONDS*SAMPLE_RATE;
-  const stepSize=STEP_SECONDS*SAMPLE_RATE;
-  const totalChunks=Math.max(1,Math.ceil(Math.max(1,waveform.length-chunkSize)/stepSize)+1);
-  const words:TimedWord[]=[];
-  for(let index=0,offset=0;offset<waveform.length;index++,offset+=stepSize){
-    const end=Math.min(waveform.length,offset+chunkSize);
-    const chunk=waveform.slice(offset,end);
-    try{
-      const result=await pipe(chunk,{
-        return_timestamps:'word',
-        ...(language?{language,task:'transcribe'}:{task:'transcribe'}),
-        force_full_sequences:false
-      });
-      const local=splitTimedTranscript(result?.chunks??[]);
-      const chunkStart=offset/SAMPLE_RATE;
-      for(const word of local){
-        const start=chunkStart+Math.max(0,word.start);
-        const endTime=chunkStart+Math.max(word.start,word.end);
-        if(endTime<=chunkStart+0.05)continue;
-        if(start>=chunkStart+CHUNK_SECONDS-0.08&&endTime>=chunkStart+CHUNK_SECONDS-0.08)continue;
-        words.push({...word,start,end:endTime});
-      }
-    }catch(err){
-      throw new Error('Whisper chunk '+(index+1)+'/'+totalChunks+' failed at '+(offset/SAMPLE_RATE).toFixed(2)+'s: '+(err instanceof Error?err.message:String(err)));
-    }
-    onProgress((index+1)/totalChunks);
-    await yieldToUi();
-  }
-  words.sort((a,b)=>a.start-b.start);
-  const deduped:TimedWord[]=[];
-  for(const word of words){
-    const prev=deduped[deduped.length-1];
-    if(prev&&normalizeTranscriptWord(prev.text)===normalizeTranscriptWord(word.text)&&Math.abs(prev.start-word.start)<1.25){
-      prev.start=Math.min(prev.start,word.start);
-      prev.end=Math.max(prev.end,word.end);
-    }else deduped.push(word);
-  }
-  return deduped;
-}
-
-async function runRealAlignmentasync function runRealAlignment(file:File,lines:string[],lang:string,onProgress:(value:number,label:string,detail:string)=>void):Promise<RealAlignment>{
+async function runRealAlignment(file:File,lines:string[],lang:string,onProgress:(value:number,label:string,detail:string)=>void):Promise<RealAlignment>{
   const pipe=await getAlignmentPipeline();
   const ctx=await getAudioContext();if(!ctx)throw new Error('Web Audio is unavailable.');
   onProgress(8,'Preparing acoustic alignment','Decoding the actual inserted vocal stem.');
   const buffer=await ctx.decodeAudioData(await file.arrayBuffer());
   const waveform=resampleTo16k(buffer.getChannelData(0),buffer.sampleRate);
   const language=alignmentLanguage(lang);
-  onProgress(20,'Recognizing sung words','Running Whisper on the actual waveform in bounded acoustic windows.');
-  const observed=await transcribeLongAudio(pipe,waveform,language,(value)=>onProgress(20+value*36,'Recognizing sung words','Whisper acoustic chunks are being aligned.'));
-  onProgress(58,'Force-aligning supplied lyrics','Mapping your exact textbox words onto the observed acoustic sequence.');
-  return alignLyricsToTranscript(lines,observed);
+  onProgress(20,'Recognizing sung words','Running local word timestamps against the actual waveform.');
+  const result=await pipe(waveform,{
+    return_timestamps:'word',
+    chunk_length_s:29,
+    stride_length_s:5,
+    ...(language?{language,task:'transcribe'}:{task:'transcribe'})
+  });
+  onProgress(58,'Force-aligning supplied lyrics','Mapping your exact textbox words onto the observed vocal sequence.');
+  return alignLyricsToTranscript(lines,splitTimedTranscript(result?.chunks??[]));
 }
 
 async function getAudioContext(){
