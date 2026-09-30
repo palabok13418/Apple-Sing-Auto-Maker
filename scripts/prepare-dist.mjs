@@ -9,6 +9,7 @@ mkdirSync(dist, { recursive: true });
 copyFileSync(resolve(root, "index.html"), resolve(dist, "index.html"));
 copyFileSync(resolve(root, "src", "style.css"), resolve(dist, "style.css"));
 copyFileSync(resolve(root, "src", "main.js"), resolve(dist, "main.js"));
+copyFileSync(resolve(root, "src", "whisper-worker.js"), resolve(dist, "whisper-worker.js"));
 
 const indexPath = resolve(dist, "index.html");
 let html = readFileSync(indexPath, "utf8");
