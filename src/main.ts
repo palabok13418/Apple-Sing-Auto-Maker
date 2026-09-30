@@ -1,5 +1,9 @@
 type AudioInterval = {start:number; end:number};
 type AudioPeak = {time:number; strength:number};
+type TimedWord = {text:string; start:number; end:number; score:number};
+type AlignedWord = {text:string; start:number; end:number; score:number};
+type AlignedLine = {text:string; begin:number; end:number; words:AlignedWord[]};
+type RealAlignment = {lines:AlignedLine[]; matchedWords:number; totalWords:number; coverage:number; model:string};
 type AudioStats = {duration:number; sampleRate:number; channels:number; rms:number; zcr:number; centroid:number; flatness:number; lowRatio:number; harmonicity:number; secondaryVoice:number; secondaryVoicePeak:number; vocalActivity:number; vocalCoverage:number; secondaryIntervals:AudioInterval[]; vocalIntervals:AudioInterval[]; syllablePeaks:AudioPeak[]; backingPeaks:AudioPeak[]};
 type FileSlot = {file:File; stats?:AudioStats; score?:number};
 
@@ -13,6 +17,9 @@ let audioContext:AudioContext|null=null;
 let gpuDevice:{destroy?:()=>void}|null=null;
 let webnnContext:unknown=null;
 let gpuComputeReady=false;
+let alignmentPipelinePromise:Promise<any>|null=null;
+let lastLeadAlignment:RealAlignment|null=null;
+let lastBackingAlignment:RealAlignment|null=null;
 const analysisCache=new Map<string,AudioStats>();
 const settings={cpu:true,gpu:false,adaptive:true,cache:true,responsive:true};
 
@@ -78,6 +85,147 @@ function fftLike(samples:Float32Array,sampleRate:number,maxFft=2048):Pick<AudioS
   const secondaryVoice=primary&&secondary?clamp01(((secondary.score/Math.max(.01,primary.score))-.58)/.42)*clamp01((primary.score-.18)/.52):0;
   const vocalActivity=clamp01(harmonicity*.72+Math.min(1,rms*24)*.18+(1-flatness)*.10);
   return {rms,zcr,centroid,flatness,lowRatio,harmonicity,secondaryVoice,vocalActivity};
+}
+
+function normalizeAlignmentToken(text:string):string{
+  return text.normalize('NFKD').toLowerCase().replace(/\\p{M}/gu,'').replace(/[^\\p{L}\\p{N}]+/gu,'').trim();
+}
+function alignmentSimilarity(a:string,b:string):number{
+  const aa=normalizeAlignmentToken(a),bb=normalizeAlignmentToken(b);
+  if(!aa||!bb)return 0;
+  if(aa===bb)return 1;
+  const prev=new Array<number>(bb.length+1);
+  const next=new Array<number>(bb.length+1);
+  for(let j=0;j<=bb.length;j++)prev[j]=j;
+  for(let i=1;i<=aa.length;i++){
+    next[0]=i;
+    for(let j=1;j<=bb.length;j++){
+      const cost=aa[i-1]===bb[j-1]?0:1;
+      next[j]=Math.min(prev[j]+1,next[j-1]+1,prev[j-1]+cost);
+    }
+    for(let j=0;j<=bb.length;j++)prev[j]=next[j];
+  }
+  return 1-prev[bb.length]/Math.max(aa.length,bb.length);
+}
+function splitTimedTranscript(chunks:any[]):TimedWord[]{
+  const out:TimedWord[]=[];
+  for(const chunk of Array.isArray(chunks)?chunks:[]){
+    const text=String(chunk?.text??'').trim();
+    const ts=chunk?.timestamp??chunk?.timestamps;
+    if(!text||!Array.isArray(ts)||!Number.isFinite(ts[0])||!Number.isFinite(ts[1]))continue;
+    const start=Math.max(0,Number(ts[0])),end=Math.max(start,Number(ts[1]));
+    const pieces=text.match(/\\S+/gu)??[];
+    if(pieces.length===1){if(end>start)out.push({text:pieces[0],start,end,score:1});continue;}
+    const weights=pieces.map((p:string)=>Math.max(1,normalizeAlignmentToken(p).length));
+    const total=weights.reduce((a:number,b:number)=>a+b,0)||1;
+    let cursor=start;
+    for(let i=0;i<pieces.length;i++){
+      const pieceEnd=i===pieces.length-1?end:cursor+(end-start)*weights[i]/total;
+      if(pieceEnd>cursor)out.push({text:pieces[i],start:cursor,end:pieceEnd,score:1});
+      cursor=pieceEnd;
+    }
+  }
+  return out.sort((a,b)=>a.start-b.start);
+}
+function alignLyricsToTranscript(lines:string[],observed:TimedWord[]):RealAlignment{
+  const known:Array<{text:string;line:number}>=[];
+  lines.forEach((line,lineIndex)=>splitWords(line).forEach(text=>known.push({text,line:lineIndex})));
+  if(!known.length)throw new Error('No lyric words are available for alignment.');
+  if(!observed.length)throw new Error('The acoustic model returned no timed vocal words.');
+
+  const N=known.length,M=observed.length,width=M+1,NEG=-1e9;
+  const dp=new Float32Array((N+1)*width);dp.fill(NEG);
+  const back=new Int8Array((N+1)*width);
+  const at=(i:number,j:number)=>i*width+j;
+  dp[0]=0;
+
+  for(let i=0;i<=N;i++){
+    for(let j=0;j<=M;j++){
+      const cur=dp[at(i,j)];if(cur<=NEG/2)continue;
+      if(i<N&&j<M){
+        const sim=alignmentSimilarity(known[i].text,observed[j].text);
+        const score=cur+(sim>=.55?1.6*sim+.25:-.85);
+        const k=at(i+1,j+1);
+        if(score>dp[k]){dp[k]=score;back[k]=1;}
+      }
+      if(i<N){
+        const k=at(i+1,j),score=cur-1.20;
+        if(score>dp[k]){dp[k]=score;back[k]=2;}
+      }
+      if(j<M){
+        const k=at(i,j+1),score=cur-.42;
+        if(score>dp[k]){dp[k]=score;back[k]=3;}
+      }
+    }
+  }
+
+  const mapped:Array<AlignedWord|null>=new Array(N).fill(null);
+  let i=N,j=M;
+  while(i||j){
+    const action=back[at(i,j)];
+    if(action===1){
+      const sim=alignmentSimilarity(known[i-1].text,observed[j-1].text);
+      if(sim>=.55)mapped[i-1]={text:known[i-1].text,start:observed[j-1].start,end:observed[j-1].end,score:sim};
+      i--;j--;
+    }else if(action===2)i--;
+    else if(action===3)j--;
+    else break;
+  }
+
+  const matched=mapped.filter(Boolean).length,coverage=matched/Math.max(1,N);
+  if(coverage<.82)throw new Error('Only '+(coverage*100).toFixed(1)+'% of the supplied lyrics could be acoustically matched. Generation stopped instead of fabricating timestamps.');
+
+  const linesOut:AlignedLine[]=lines.map((text,lineIndex)=>{
+    const words:AlignedWord[]=[];
+    known.forEach((entry,index)=>{if(entry.line===lineIndex&&mapped[index])words.push(mapped[index]!);});
+    if(!words.length)throw new Error('Lyric line '+(lineIndex+1)+' could not be acoustically aligned.');
+    return {text,begin:Math.min(...words.map(w=>w.start)),end:Math.max(...words.map(w=>w.end)),words};
+  });
+  return {lines:linesOut,matchedWords:matched,totalWords:N,coverage,model:'Whisper word timestamps + monotonic forced alignment'};
+}
+function resampleTo16k(samples:Float32Array,sourceRate:number):Float32Array{
+  if(sourceRate===16000)return samples;
+  const length=Math.max(1,Math.round(samples.length*16000/sourceRate));
+  const out=new Float32Array(length);
+  const scale=(samples.length-1)/Math.max(1,length-1);
+  for(let i=0;i<length;i++){
+    const pos=i*scale,left=Math.floor(pos),frac=pos-left;
+    const a=samples[left]??0,b=samples[Math.min(samples.length-1,left+1)]??a;
+    out[i]=a+(b-a)*frac;
+  }
+  return out;
+}
+function alignmentLanguage(lang:string):string|undefined{
+  const map:Record<string,string>={'en-US':'english',ja:'japanese',ko:'korean','zh-Hans':'chinese',fil:'tagalog'};
+  return map[lang];
+}
+async function getAlignmentPipeline():Promise<any>{
+  if(alignmentPipelinePromise)return alignmentPipelinePromise;
+  alignmentPipelinePromise=(async()=>{
+    const load=new Function('u','return import(u)') as (u:string)=>Promise<any>;
+    const mod=await load('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm');
+    return mod.pipeline('automatic-speech-recognition','onnx-community/whisper-tiny',{
+      device:settings.gpu&&gpuComputeReady?'webgpu':'wasm'
+    });
+  })();
+  return alignmentPipelinePromise;
+}
+async function runRealAlignment(file:File,lines:string[],lang:string,onProgress:(value:number,label:string,detail:string)=>void):Promise<RealAlignment>{
+  const pipe=await getAlignmentPipeline();
+  const ctx=await getAudioContext();if(!ctx)throw new Error('Web Audio is unavailable.');
+  onProgress(8,'Preparing acoustic alignment','Decoding the actual inserted vocal stem.');
+  const buffer=await ctx.decodeAudioData(await file.arrayBuffer());
+  const waveform=resampleTo16k(buffer.getChannelData(0),buffer.sampleRate);
+  const language=alignmentLanguage(lang);
+  onProgress(20,'Recognizing sung words','Running local word timestamps against the actual waveform.');
+  const result=await pipe({raw:waveform,sampling_rate:16000},{
+    return_timestamps:'word',
+    chunk_length_s:30,
+    stride_length_s:5,
+    ...(language?{language,task:'transcribe'}:{task:'transcribe'})
+  });
+  onProgress(58,'Force-aligning supplied lyrics','Mapping your exact textbox words onto the observed vocal sequence.');
+  return alignLyricsToTranscript(lines,splitTimedTranscript(result?.chunks??[]));
 }
 
 async function getAudioContext(){
@@ -579,6 +727,24 @@ function renderLine(line:LyricLineUnit,index:number,secondaryIntervals:AudioInte
   return '      <p begin="'+toTime(line.begin)+'" end="'+toTime(line.end)+'" itunes:key="L'+(index+1)+'" ttm:agent="'+agent+'">\n        '+main+bg+'\n      </p>';
 }
 
+function renderRealAlignedLine(line:LyricLineUnit,index:number,backing:AlignedLine|null,backingPeaks:AudioPeak[],secondaryIntervals:AudioInterval[],autoV2:boolean,autoBg:boolean):string{
+  const agent=autoV2&&lineAgent(line,secondaryIntervals,true)==='v2'?'v2':'v1';
+  let bg='';
+  if(autoBg&&backing?.words.length){
+    const units:SyllableUnit[]=[];
+    backing.words.forEach((word,wordIndex)=>{
+      if(word.end*1000<line.begin-80||word.start*1000>line.end+80)return;
+      refineWordSyllables(word.text,word.start*1000,word.end*1000,($('lang') as HTMLSelectElement).value,backingPeaks)
+        .forEach(unit=>units.push({...unit,wordIndex}));
+    });
+    if(units.length){
+      const bgStart=Math.max(line.begin,Math.min(line.end,Math.min(...units.map(x=>x.begin))));
+      const bgEnd=Math.max(bgStart,Math.min(line.end,Math.max(...units.map(x=>x.end))));
+      if(bgEnd>bgStart)bg='\n        <span ttm:role="x-bg" begin="'+toTime(bgStart)+'" end="'+toTime(bgEnd)+'">'+renderSyllables(units)+'</span>';
+    }
+  }
+  return '      <p begin="'+toTime(line.begin)+'" end="'+toTime(line.end)+'" itunes:key="L'+(index+1)+'" ttm:agent="'+agent+'">\n        '+renderSyllables(line.syllables)+bg+'\n      </p>';
+}
 async function makeTtml(onProgress:(value:number,label:string,detail:string)=>void=()=>{}){
   const title=escapeHtml(decodeCommonEntities(($('title') as HTMLInputElement).value||'Untitled Session'));
   const artist=escapeHtml(decodeCommonEntities(($('artist') as HTMLInputElement).value||'Unknown Artist'));
@@ -586,40 +752,36 @@ async function makeTtml(onProgress:(value:number,label:string,detail:string)=>vo
   const lines=getLyricLines();
   if(!lines.length)throw new Error('Enter at least one lyric line before generating.');
   if(!lead?.stats||!backing?.stats)throw new Error('Analyze both stems before generating.');
-  if(lead.stats.syllablePeaks.length<2)throw new Error('Lead audio did not contain enough stable vocal timing anchors for real alignment.');
-  if(backing.stats.vocalIntervals.length<1)throw new Error('Backing audio did not contain a stable vocal region for BG analysis.');
 
   const durationMs=Math.max(1000,Math.max(lead.stats.duration,backing.stats.duration)*1000);
-  const leadIntervals=normalizeIntervals(lead.stats.vocalIntervals,durationMs/1000,.10);
   const secondaryIntervals=normalizeIntervals(lead.stats.secondaryIntervals,durationMs/1000,.10);
-  const backingIntervals=normalizeIntervals(backing.stats.vocalIntervals,durationMs/1000,.10);
   const secondaryCoverage=secondaryIntervals.reduce((n,x)=>n+Math.max(0,x.end-x.start),0);
   const v2Detected=(lead.stats.secondaryVoicePeak??0)>=.62&&secondaryIntervals.length>0&&secondaryCoverage>=.08;
-  const bgDetected=(backing.stats.vocalCoverage??0)>=.045&&(backing.stats.vocalActivity??0)>=.44&&backingIntervals.length>0&&backing.stats.syllablePeaks.length>=2&&(backing.score??0)>=.60;
+  const bgDetected=(backing.stats.vocalCoverage??0)>=.045&&(backing.stats.vocalActivity??0)>=.44&&backing.stats.vocalIntervals.length>0&&backing.stats.syllablePeaks.length>=2&&(backing.score??0)>=.60;
   const allowV2=qs<HTMLButtonElement>('[data-toggle="v2"]').classList.contains('on');
   const allowBg=qs<HTMLButtonElement>('[data-toggle="bg"]').classList.contains('on');
-  const autoV2=v2Detected&&allowV2;
-  const autoBg=bgDetected&&allowBg;
+  const autoV2=v2Detected&&allowV2,autoBg=bgDetected&&allowBg;
 
-  onProgress(10,'Reading lyric lines','The textbox is the source transcript; every Enter is a separate alignment target.');
-  await yieldToUi();
-  onProgress(20,'Using actual lead-vocal timing','Scanning real vocal intervals and local audio peaks for phrase and syllable anchors.');
-  const lineUnits=buildLyricLineTimeline(lines,durationMs,lang,leadIntervals,lead.stats.syllablePeaks);
-  await yieldToUi();
+  onProgress(2,'Starting real acoustic alignment','The lead stem is the timing source for the main lyrics.');
+  lastLeadAlignment=await runRealAlignment(lead.file,lines,lang,(value,label,detail)=>onProgress(value*.62,label,detail));
+  if(lastLeadAlignment.coverage<.90)log('alignment warning: lead lyric coverage is '+(lastLeadAlignment.coverage*100).toFixed(1)+'%');
 
+  onProgress(63,'Aligning backing vocal audio','The backing stem is aligned independently so BG timestamps come from that file.');
+  lastBackingAlignment=await runRealAlignment(backing.file,lines,lang,(value,label,detail)=>onProgress(63+value*.23,label,detail));
+
+  const leadUnits=alignmentToLyricUnits(lastLeadAlignment,lead.stats.syllablePeaks,lang);
   let partial=makeDocumentHead(title,artist,lang,autoV2);
   $('xml').textContent=partial+makeDocumentTail();
-  for(let i=0;i<lineUnits.length;i++){
-    partial+=renderLine(lineUnits[i],i,secondaryIntervals,backingIntervals,autoV2,autoBg)+'\n';
-    const pct=24+(i+1)/lineUnits.length*68;
-    onProgress(pct,'Developing TTML line '+(i+1)+' / '+lineUnits.length,'Writing the completed line from real audio-derived timing anchors.');
+
+  for(let i=0;i<leadUnits.length;i++){
+    partial+=renderRealAlignedLine(leadUnits[i],i,lastBackingAlignment.lines[i]??null,backing.stats.syllablePeaks,secondaryIntervals,autoV2,autoBg)+'\n';
     $('xml').textContent=partial+makeDocumentTail();
+    onProgress(86+(i+1)/leadUnits.length*11,'Writing aligned lyric line '+(i+1)+' / '+leadUnits.length,'Writing measured audio timings into TTML.');
     await yieldToUi();
   }
-  onProgress(94,'Detecting backing-vocal placements','Using the independent backing-stem vocal envelope for BG spans.');
-  await yieldToUi();
+
   const xml=partial+makeDocumentTail();
-  if(/00:-|:-\d|--/.test(xml))throw new Error('Internal timing guard rejected a negative or malformed lyric timestamp.');
+  if(/00:-|:-\\d|--/.test(xml))throw new Error('Internal timing guard rejected a malformed timestamp.');
   return xml;
 }
 function parseTtmlTime(value:string|null):number{
