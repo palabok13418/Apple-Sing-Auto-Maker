@@ -87,10 +87,13 @@ async function getAudioContext(){
   return audioContext;
 }
 function getAnalysisPlan(duration:number){
-  const maxWindows=$('eco').classList.contains('on')?12:24;
-  const minWindows=$('eco').classList.contains('on')?6:8;
+  const eco=$('eco').classList.contains('on');
+  const fftSize=eco?1024:2048;
+  if(!settings.adaptive)return {windows:16,fftSize};
+  const maxWindows=eco?12:24;
+  const minWindows=eco?6:8;
   const windows=Math.max(minWindows,Math.min(maxWindows,Math.round(duration/5)||minWindows));
-  return {windows,fftSize:$('eco').classList.contains('on')?1024:2048};
+  return {windows,fftSize};
 }
 function fileKey(file:File,plan:{windows:number;fftSize:number}){
   return [file.name,file.size,file.lastModified,file.type,plan.windows,plan.fftSize].join('|');
@@ -105,6 +108,17 @@ function mergeIntervals(intervals:AudioInterval[],gap=.35):AudioInterval[]{
   const merged:AudioInterval[]=[{start:sorted[0].start,end:sorted[0].end}];
   for(const next of sorted.slice(1)){const last=merged[merged.length-1];if(next.start<=last.end+gap)last.end=Math.max(last.end,next.end);else merged.push({start:next.start,end:next.end});}
   return merged;
+}
+function normalizeIntervals(intervals:AudioInterval[],durationSeconds:number,gap=.18):AudioInterval[]{
+  const safe=intervals
+    .map(x=>({
+      start:Math.max(0,Math.min(durationSeconds,Number.isFinite(x.start)?x.start:0)),
+      end:Math.max(0,Math.min(durationSeconds,Number.isFinite(x.end)?x.end:0))
+    }))
+    .filter(x=>x.end>x.start);
+  return mergeIntervals(safe,gap)
+    .map(x=>({start:Math.max(0,x.start),end:Math.max(Math.max(0,x.start),Math.min(durationSeconds,x.end))}))
+    .filter(x=>x.end-x.start>=.04);
 }
 function extractVocalIntervals(samples:Float32Array,sampleRate:number):{intervals:AudioInterval[];coverage:number}{
   // Lightweight envelope pass for lyric-line alignment. It uses RMS + zero-crossing
@@ -133,8 +147,8 @@ function extractVocalIntervals(samples:Float32Array,sampleRate:number):{interval
     const closing=(!active[f]&&start>=0)||f===frames-1;
     if(closing){const endFrame=!active[f]?f:f+1;const a=start*frame/sampleRate;const b=Math.min(samples.length/sampleRate,endFrame*frame/sampleRate);if(b-a>=.12)raw.push({start:a,end:b});start=-1;}
   }
-  const intervals=mergeIntervals(raw,.24);
-  const covered=intervals.reduce((n,x)=>n+x.end-x.start,0);
+  const intervals=normalizeIntervals(raw,samples.length/Math.max(1,sampleRate),.24);
+  const covered=intervals.reduce((n,x)=>n+Math.max(0,x.end-x.start),0);
   return {intervals,coverage:clamp01(covered/Math.max(1,samples.length/sampleRate))};
 }
 
@@ -190,27 +204,52 @@ function syllableWeight(text:string):number{return Math.max(1,[...text].filter(c
 function overlapSeconds(a:AudioInterval,b:{start:number;end:number}):number{return Math.max(0,Math.min(a.end,b.end)-Math.max(a.start,b.start));}
 function overlapWithIntervals(start:number,end:number,intervals:AudioInterval[]):number{return intervals.reduce((sum,x)=>sum+overlapSeconds(x,{start,end}),0);}
 function activeTimelineMap(activeMs:number,intervals:AudioInterval[],durationMs:number):number{
-  if(!intervals.length)return Math.max(0,Math.min(durationMs,activeMs));
-  let remaining=Math.max(0,activeMs);
-  for(const x of intervals){const a=x.start*1000;const b=x.end*1000;const len=b-a;if(remaining<=len)return a+remaining;remaining-=len;}
-  return durationMs;
+  const safeDuration=Math.max(0,Number.isFinite(durationMs)?durationMs:0);
+  const remainingMs=Math.max(0,Number.isFinite(activeMs)?activeMs:0);
+  if(!safeDuration)return 0;
+  if(!intervals.length)return Math.min(safeDuration,remainingMs);
+  let remaining=remainingMs;
+  for(const x of intervals){
+    const a=Math.max(0,Math.min(safeDuration,x.start*1000));
+    const b=Math.max(a,Math.min(safeDuration,x.end*1000));
+    const len=Math.max(0,b-a);
+    if(remaining<=len)return Math.max(0,Math.min(safeDuration,a+remaining));
+    remaining-=len;
+  }
+  return safeDuration;
 }
 function buildLyricLineTimeline(lines:string[],durationMs:number,lang:string,intervals:AudioInterval[]):LyricLineUnit[]{
-  const weights=lines.map(line=>{const words=splitWords(line);return Math.max(1,words.reduce((n,w)=>n+splitSyllables(w,lang).reduce((m,s)=>m+syllableWeight(s),0),0));});
-  const totalWeight=weights.reduce((a,b)=>a+b,0)||1; const activeMs=intervals.reduce((n,x)=>n+(x.end-x.start)*1000,0); const usableMs=activeMs>0?activeMs:durationMs; let cursor=0;
+  const safeDuration=Math.max(1,Number.isFinite(durationMs)?durationMs:1);
+  const safeIntervals=normalizeIntervals(intervals,safeDuration/1000);
+  const weights=lines.map(line=>{
+    const words=splitWords(line);
+    return Math.max(1,words.reduce((n,w)=>n+splitSyllables(w,lang).reduce((m,s)=>m+syllableWeight(s),0),0));
+  });
+  const totalWeight=weights.reduce((a,b)=>a+b,0)||1;
+  const activeMs=safeIntervals.reduce((n,x)=>n+Math.max(0,x.end-x.start)*1000,0);
+  const usableMs=activeMs>0?activeMs:safeDuration;
+  let cursor=0;
   return lines.map((line,i)=>{
-    const lineStart=activeTimelineMap(cursor,intervals,durationMs);
+    const lineStart=Math.max(0,Math.min(safeDuration,activeTimelineMap(cursor,safeIntervals,safeDuration)));
     cursor+=usableMs*weights[i]/totalWeight;
-    let lineEnd=activeTimelineMap(cursor,intervals,durationMs);
-    if(lineEnd<=lineStart)lineEnd=Math.min(durationMs,lineStart+80);
+    let lineEnd=Math.max(0,Math.min(safeDuration,activeTimelineMap(cursor,safeIntervals,safeDuration)));
+    if(lineEnd<=lineStart)lineEnd=Math.min(safeDuration,lineStart+Math.max(1,Math.min(120,safeDuration-lineStart)));
     const words=splitWords(line); const syllables:SyllableUnit[]=[];
     const entries=words.flatMap((word,wi)=>splitSyllables(word,lang).map(text=>({text,wordIndex:wi,weight:syllableWeight(text)})));
     const sum=entries.reduce((n,x)=>n+x.weight,0)||1; let c=lineStart;
     for(let j=0;j<entries.length;j++){
-      const x=entries[j]; const end=j===entries.length-1?lineEnd:c+(lineEnd-lineStart)*x.weight/sum;
-      syllables.push({text:x.text,begin:c,end:Math.max(c+1,end),wordIndex:x.wordIndex}); c=end;
+      const x=entries[j];
+      const proposedEnd=j===entries.length-1?lineEnd:c+(lineEnd-lineStart)*x.weight/sum;
+      const end=Math.max(c,Math.min(lineEnd,proposedEnd));
+      syllables.push({text:x.text,begin:Math.max(0,Math.min(safeDuration,c)),end:Math.max(0,Math.min(safeDuration,end)),wordIndex:x.wordIndex});
+      c=end;
     }
-    if(syllables.length)syllables[syllables.length-1].end=lineEnd;
+    if(syllables.length){
+      syllables[0].begin=Math.max(0,Math.min(safeDuration,syllables[0].begin));
+      syllables[syllables.length-1].end=Math.max(syllables[syllables.length-1].begin,Math.min(safeDuration,lineEnd));
+      for(let j=1;j<syllables.length;j++)syllables[j].begin=Math.max(syllables[j].begin,syllables[j-1].begin);
+      for(let j=0;j<syllables.length-1;j++)syllables[j].end=Math.max(syllables[j].begin,Math.min(syllables[j+1].begin,syllables[j].end));
+    }
     return {text:line,begin:lineStart,end:lineEnd,syllables};
   });
 }
@@ -224,19 +263,21 @@ function lineAgent(line:LyricLineUnit,secondary:AudioInterval[],detected:boolean
   return overlap/Math.max(.08,(line.end-line.begin)/1000)>=.18?'v2':'v1';
 }
 function classify(s:AudioStats):number{
-  // This is still an admission heuristic until the trained tiny model is
-  // shipped. It is deliberately calibrated around sung-voice characteristics
-  // instead of the old invalid sample-index measurements.
-  const voiced=Math.min(1,Math.max(0,s.harmonicity*.9 + (1-s.zcr*5)*.1));
-  const vocalBand=Math.max(0,1-Math.abs(s.lowRatio-.22)*2.8);
-  const midCentroid=Math.max(0,1-Math.abs(s.centroid-.28)*2.4);
-  const tonal=Math.max(0,1-s.flatness*.9);
-  return Math.max(0,Math.min(1,.42*voiced+.24*vocalBand+.20*midCentroid+.14*tonal));
+  // Compact calibrated ensemble. It uses whole-track vocal coverage in addition
+  // to timbre and periodicity, then penalizes noisy/ambiguous feature mixtures.
+  const periodicity=clamp01(s.harmonicity*.78+s.vocalActivity*.22);
+  const tonal=clamp01((1-s.flatness)*.65+Math.max(0,1-s.zcr*4)*.35);
+  const voiceBand=clamp01(1-Math.abs(s.lowRatio-.22)*3.2);
+  const formantBand=clamp01(1-Math.abs(s.centroid-.30)*2.6);
+  const coverage=clamp01(s.vocalCoverage/.34);
+  const noiseRisk=clamp01(s.flatness*.72+s.zcr*.38);
+  const ambiguity=clamp01(Math.abs(periodicity-tonal)*1.6+noiseRisk*.45);
+  const raw=.30*periodicity+.20*tonal+.16*voiceBand+.14*formantBand+.20*coverage;
+  return clamp01(raw-.15*noiseRisk-.08*ambiguity);
 }
 
 async function analyzeSlot(slot:FileSlot,label:string,base:number,span:number){
   log(label+': decoding local analysis windows…');
-  const plan=getAnalysisPlan(60);
   const stats=await inspect(slot.file,f=>{
     setProgress(base+f*span,'Analyzing '+label,Math.round(f*100)+'% of the analysis window budget');
   });
@@ -245,7 +286,8 @@ async function analyzeSlot(slot:FileSlot,label:string,base:number,span:number){
   slot.score=classify(stats);
   log(label+': '+stats.duration.toFixed(2)+'s • '+stats.sampleRate+' Hz • '+stats.channels+'ch • confidence '+(slot.score*100).toFixed(1)+'%');
   log(label+': vocal activity '+(stats.vocalActivity*100).toFixed(0)+'% • vocal coverage '+(stats.vocalCoverage*100).toFixed(0)+'% • second-voice signal '+(stats.secondaryVoice*100).toFixed(0)+'%');
-  log(label+': plan • '+getAnalysisPlan(stats.duration).windows+' windows / '+plan.fftSize+'-point FFT');
+  const plan=getAnalysisPlan(stats.duration);
+  log(label+': plan • '+plan.windows+' windows / '+plan.fftSize+'-point FFT'+(settings.adaptive?'':' • fixed profile'));
   return slot.score;
 }
 
@@ -353,6 +395,8 @@ refreshProfile();
 
 $('analyze').addEventListener('click',async()=>{
   if(!lead||!backing){setGate('bad','Both Lead Vocals and Backing Vocals are required.');return;}
+  const sameFile=lead.file===backing.file || (lead.file.size===backing.file.size&&lead.file.lastModified===backing.file.lastModified&&lead.file.name===backing.file.name);
+  if(sameFile){setGate('bad','Lead vocals and backing vocals must be two different audio files.');return;}
   $('analyze').setAttribute('disabled','true'); $('generate').setAttribute('disabled','true'); setProgress(1,'Starting analysis','Decoding the two required stems.'); setGate('wait','Analyzing both stems…'); log('gate: starting compact feature pass…');
   try{
     const a=await analyzeSlot(lead,'lead',2,46); const b=await analyzeSlot(backing,'backing',48,46);
@@ -369,18 +413,29 @@ $('analyze').addEventListener('click',async()=>{
 
 function setProgress(n:number,label='Working…',detail='Processing locally…'){$('progressBar').style.width=Math.max(0,Math.min(100,n))+'%';$('pct').textContent=Math.round(Math.max(0,Math.min(100,n)))+'%';$('progressLabel').textContent=label;$('progressDetail').textContent=detail;}
 function sleep(ms:number){return new Promise<void>(r=>setTimeout(r,ms));}
-function toTime(ms:number){const s=ms/1000;const m=Math.floor(s/60);const sec=s-m*60;return `00:${String(m).padStart(2,'0')}:${sec.toFixed(3).padStart(6,'0')}`;}
-function makeTtml(){
+function toTime(ms:number){
+  const safeMs=Math.max(0,Number.isFinite(ms)?ms:0);
+  const totalSeconds=safeMs/1000;
+  const hours=Math.floor(totalSeconds/3600);
+  const minutes=Math.floor((totalSeconds-hours*3600)/60);
+  const seconds=totalSeconds-hours*3600-minutes*60;
+  return String(hours).padStart(2,'0')+':'+String(minutes).padStart(2,'0')+':'+seconds.toFixed(3).padStart(6,'0');
+}
+function makeTtml(onProgress:(value:number,label:string,detail:string)=>void=()=>{}){
   const title=escapeHtml(decodeCommonEntities(($('title') as HTMLInputElement).value||'Untitled Session'));
   const artist=escapeHtml(decodeCommonEntities(($('artist') as HTMLInputElement).value||'Unknown Artist'));
   const lang=($('lang') as HTMLSelectElement).value; const lines=getLyricLines();
   const durationMs=Math.max(1000,(backing?.stats?.duration??lead?.stats?.duration??4)*1000);
-  const leadIntervals=lead?.stats?.vocalIntervals??[]; const secondaryIntervals=lead?.stats?.secondaryIntervals??[]; const backingIntervals=backing?.stats?.vocalIntervals??[];
+  const leadIntervals=normalizeIntervals(lead?.stats?.vocalIntervals??[],durationMs/1000,.18);
+  const secondaryIntervals=normalizeIntervals(lead?.stats?.secondaryIntervals??[],durationMs/1000,.18);
+  const backingIntervals=normalizeIntervals(backing?.stats?.vocalIntervals??[],durationMs/1000,.18);
   const v2Detected=(lead?.stats?.secondaryVoice??0)>=.58&&secondaryIntervals.length>0;
   const bgDetected=(backing?.stats?.vocalCoverage??0)>=.015&&backingIntervals.length>0&&(backing?.score??0)>=.60;
   const allowV2=qs<HTMLButtonElement>('[data-toggle="v2"]').classList.contains('on'); const allowBg=qs<HTMLButtonElement>('[data-toggle="bg"]').classList.contains('on');
   const autoV2=v2Detected&&allowV2; const autoBg=bgDetected&&allowBg;
+  onProgress(24,'Mapping lyric lines','Keeping every Enter-separated lyric line as its own timing unit.');
   const lineUnits=buildLyricLineTimeline(lines,durationMs,lang,leadIntervals);
+  onProgress(52,'Building syllable timing','Breaking the supplied lines into syllables and distributing timing across analyzed vocal activity.');
   const outputLines=lineUnits.map((line,i)=>{
     const agent=lineAgent(line,secondaryIntervals,autoV2);
     const main=renderSyllables(line.syllables);
@@ -388,19 +443,42 @@ function makeTtml(){
     let bg='';
     if(lineBacking.length){
       const bgSyllables=line.syllables.filter(u=>overlapWithIntervals(u.begin/1000,u.end/1000,lineBacking)>.015);
-      if(bgSyllables.length){const bgStart=Math.min(...bgSyllables.map(x=>x.begin));const bgEnd=Math.max(...bgSyllables.map(x=>x.end));bg='\n        <span ttm:role="x-bg" begin="'+toTime(bgStart)+'" end="'+toTime(bgEnd)+'">'+renderSyllables(bgSyllables)+'</span>';}
+      if(bgSyllables.length){
+        const bgStart=Math.max(0,Math.min(durationMs,Math.min(...bgSyllables.map(x=>x.begin))));
+        const bgEnd=Math.max(bgStart,Math.min(durationMs,Math.max(...bgSyllables.map(x=>x.end))));
+        if(bgEnd>bgStart)bg='\n        <span ttm:role="x-bg" begin="'+toTime(bgStart)+'" end="'+toTime(bgEnd)+'">'+renderSyllables(bgSyllables)+'</span>';
+      }
     }
     return '      <p begin="'+toTime(line.begin)+'" end="'+toTime(line.end)+'" itunes:key="L'+(i+1)+'" ttm:agent="'+agent+'">\n        '+main+bg+'\n      </p>';
   }).join('\n');
+  onProgress(78,'Assembling TTML','Adding automatic V2 agent metadata and BG placements only when detected.');
   return '<?xml version="1.0" encoding="UTF-8"?>\n<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata" xmlns:itunes="http://music.apple.com/lyric-ttml-internal" xml:lang="'+lang+'" itunes:timing="Word">\n  <head>\n    <metadata>\n      <ttm:title>'+title+'</ttm:title>\n      <ttm:agent type="person" xml:id="v1"><ttm:name type="full">'+artist+'</ttm:name></ttm:agent>'+(autoV2?'\n      <ttm:agent type="person" xml:id="v2"><ttm:name type="full">Secondary Voice</ttm:name></ttm:agent>':'')+'\n    </metadata>\n  </head>\n  <body>\n    <div itunes:song-part="Verse">\n'+outputLines+'\n    </div>\n  </body>\n</tt>';
+}
+function parseTtmlTime(value:string|null):number{
+  if(!value||!/^(?:\\d+):[0-5]\\d:[0-5]\\d\\.\\d{3}$/.test(value))return NaN;
+  const parts=value.split(':');
+  return (Number(parts[0])*3600+Number(parts[1])*60+Number(parts[2]))*1000;
 }
 function validateTtml(xml:string){
   const doc=new DOMParser().parseFromString(xml,'application/xml');
   if(doc.getElementsByTagName('parsererror').length)throw new Error('Generated TTML failed XML validation.');
   const paragraphs=Array.from(doc.getElementsByTagName('p'));
   if(!paragraphs.length)throw new Error('Generated TTML contains no lyric lines.');
-  paragraphs.forEach((p,i)=>{if(p.getAttribute('itunes:key')!=='L'+(i+1))throw new Error('Lyric line keys are not continuous.');if(!p.getAttribute('begin')||!p.getAttribute('end'))throw new Error('A lyric line is missing timing.');});
+  let lastBegin=0;
+  paragraphs.forEach((p,i)=>{
+    if(p.getAttribute('itunes:key')!=='L'+(i+1))throw new Error('Lyric line keys are not continuous.');
+    const begin=parseTtmlTime(p.getAttribute('begin')); const end=parseTtmlTime(p.getAttribute('end'));
+    if(!Number.isFinite(begin)||!Number.isFinite(end))throw new Error('A lyric line has an invalid timestamp.');
+    if(begin<0||end<begin)throw new Error('Lyric line timing is out of order.');
+    if(i>0&&begin<lastBegin)throw new Error('Lyric line start times are not ordered.');
+    lastBegin=begin;
+    for(const span of Array.from(p.getElementsByTagName('span'))){
+      const sb=parseTtmlTime(span.getAttribute('begin')); const se=parseTtmlTime(span.getAttribute('end'));
+      if(!Number.isFinite(sb)||!Number.isFinite(se))throw new Error('A lyric syllable/BG span has an invalid timestamp.');
+      if(sb<begin||se>end||se<sb)throw new Error('A lyric syllable/BG span is outside its lyric line.');
+    }
+  });
 }
-$('generate').addEventListener('click',async()=>{if(!passed)return; if(!settings.cpu){setGate('bad','CPU analysis is disabled for the current DSP implementation.');return;} $('generate').setAttribute('disabled','true'); setProgress(0,'Generating TTML','Aligning every lyric line and syllable to the analyzed vocal envelope.'); const stages=['strict stem classifier confirmation','vocal activity + second-voice detection','full lyric-line segmentation','syllable timing anchors','automatic BG / v2 assembly','TTML XML validation']; for(let i=0;i<stages.length;i++){log('run: '+stages[i]+'…');setProgress(Math.round((i/stages.length)*100),stages[i],'Stage '+(i+1)+' of '+stages.length);await sleep($('eco').classList.contains('on')?120:220);} try{output=makeTtml();validateTtml(output);$('xml').textContent=output;const lineCount=(output.match(/itunes:key="L\d+"/g)||[]).length;const syllableCount=(output.match(/<span begin=/g)||[]).length;setProgress(100,'TTML ready',lineCount+' lyric lines • '+syllableCount+' timed syllables • automatic BG/v2 applied from analysis.');const base=(($('title') as HTMLInputElement).value||'session').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'session';$('fileName').textContent=base+'.ttml';$('download').removeAttribute('disabled');log('complete: TTML ready • '+lineCount+' lines • '+syllableCount+' timed syllables');$('result').scrollIntoView({behavior:'smooth'});}catch(err){setGate('bad',err instanceof Error?err.message:'TTML generation failed.');log('generation: ERROR');} $('generate').removeAttribute('disabled');});
+$('generate').addEventListener('click',async()=>{if(!passed)return; if(!settings.cpu){setGate('bad','CPU analysis is disabled for the current DSP implementation.');return;} $('generate').setAttribute('disabled','true'); setProgress(0,'Generating TTML','Using the analyzed vocal envelope and the exact lyric lines from the textbox.'); try{output=makeTtml((value,label,detail)=>{log('run: '+label+'…');setProgress(value,label,detail);});setProgress(88,'Validating TTML','Checking XML, timestamp format, line ordering and nested BG spans.');validateTtml(output);$('xml').textContent=output;const lineCount=(output.match(/itunes:key="L\d+"/g)||[]).length;const syllableCount=(output.match(/<span begin=/g)||[]).length;setProgress(100,'TTML ready',lineCount+' lyric lines • '+syllableCount+' timed syllables • automatic BG/v2 applied from analysis.');const base=(($('title') as HTMLInputElement).value||'session').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'session';$('fileName').textContent=base+'.ttml';$('download').removeAttribute('disabled');log('complete: TTML ready • '+lineCount+' lines • '+syllableCount+' timed syllables');$('result').scrollIntoView({behavior:'smooth'});}catch(err){setGate('bad',err instanceof Error?err.message:'TTML generation failed.');log('generation: ERROR');} $('generate').removeAttribute('disabled');});
 $('copy').addEventListener('click',async()=>{if(!output)return;try{await navigator.clipboard.writeText(output);$('copy').textContent='Copied';}catch{log('copy: clipboard permission unavailable');}});
 $('download').addEventListener('click',()=>{if(!output)return;const blob=new Blob([output],{type:'application/ttml+xml;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=$('fileName').textContent??'session.ttml';a.click();setTimeout(()=>URL.revokeObjectURL(url),500);});
