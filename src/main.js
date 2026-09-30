@@ -889,8 +889,10 @@ $('generate').addEventListener('click', async () => {
     $('download').removeAttribute('disabled');
     $('result').scrollIntoView({ behavior: 'smooth' });
   } catch (err) {
-    setGate('bad', err instanceof Error ? err.message : 'TTML generation failed.');
-    log('generation: ERROR');
+    const message = err instanceof Error ? err.message : String(err);
+    setGate('bad', message);
+    log('generation: ERROR • ' + message);
+    if (err instanceof Error && err.stack) log('generation stack: ' + err.stack.split('\\n').slice(0, 4).join(' | '));
   } finally {
     $('generate').removeAttribute('disabled');
   }
