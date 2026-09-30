@@ -688,7 +688,7 @@ $('analyze').addEventListener('click',async()=>{
     const v2Detected=(lead.stats?.secondaryVoicePeak??0)>=.62&&lead.stats?.secondaryIntervals.length>0;
     const bgDetected=(backing.stats?.vocalCoverage??0)>=.045&&(backing.stats?.vocalActivity??0)>=.44&&backing.stats?.vocalIntervals.length>0&&backing.stats?.syllablePeaks.length>=2&&b>=threshold;
     $('v2Status').textContent=v2Detected?'detected • '+Math.round((lead.stats?.secondaryVoice??0)*100)+'%':'not detected • '+Math.round((lead.stats?.secondaryVoice??0)*100)+'%';
-    $('bgStatus').textContent=bgDetected?'detected • '+backingStats.vocalIntervals.length+' vocal regions':'not detected • '+backingStats.vocalIntervals.length+' vocal regions';
+    $('bgStatus').textContent=bgDetected?'detected • '+(backing.stats?.vocalIntervals.length??0)+' vocal regions':'not detected • '+(backing.stats?.vocalIntervals.length??0)+' vocal regions';
     log('v2 detection: '+(v2Detected?'SECOND VOICE DETECTED':'no second-voice signal')); log('bg detection: '+(bgDetected?'BACKGROUND VOCAL ACTIVITY DETECTED':'no background-vocal activity detected'));
     if(ok){setProgress(100,'Analysis complete','Stem gate passed; V2/BG detection is ready for TTML assembly.');setGate('ok','Both stems passed ('+(a*100).toFixed(0)+'% / '+(b*100).toFixed(0)+'%). V2: '+(v2Detected?'detected':'not detected')+' • BG: '+(bgDetected?'detected':'not detected')+'.');$('generate').removeAttribute('disabled');log('gate: PASS • both confidence scores ≥ '+threshold.toFixed(2));}
     else{setProgress(100,'Analysis complete','At least one required stem failed the admission gate.');const failed=[leadOk?'':'lead '+(a*100).toFixed(0)+'%',backingOk?'':'backing '+(b*100).toFixed(0)+'%'].filter(Boolean).join(', ');setGate('bad','Rejected: '+failed+'. Add a cleaner isolated vocal stem and analyze again.');$('generate').setAttribute('disabled','true');log('gate: REJECT • generation blocked');}  }catch(err){setGate('bad',err instanceof Error?err.message:'Analysis failed.'); log('gate: ERROR');}
@@ -761,7 +761,7 @@ async function makeTtml(onProgress:(value:number,label:string,detail:string)=>vo
   const secondaryIntervals=normalizeIntervals(leadStats.secondaryIntervals,durationMs/1000,.10);
   const secondaryCoverage=secondaryIntervals.reduce((n,x)=>n+Math.max(0,x.end-x.start),0);
   const v2Detected=(leadStats.secondaryVoicePeak??0)>=.62&&secondaryIntervals.length>0&&secondaryCoverage>=.08;
-  const bgDetected=(backingStats.vocalCoverage??0)>=.045&&(backingStats.vocalActivity??0)>=.44&&backingStats.vocalIntervals.length>0&&backingStats.syllablePeaks.length>=2&&(backing.score??0)>=.60;
+  const bgDetected=(backingStats.vocalCoverage??0)>=.045&&(backingStats.vocalActivity??0)>=.44&&backingStats.vocalIntervals.length>0&&backingStats.syllablePeaks.length>=2&&(backingSlot.score??0)>=.60;
   const allowV2=qs<HTMLButtonElement>('[data-toggle="v2"]').classList.contains('on');
   const allowBg=qs<HTMLButtonElement>('[data-toggle="bg"]').classList.contains('on');
   const autoV2=v2Detected&&allowV2,autoBg=bgDetected&&allowBg;
