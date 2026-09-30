@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc && node scripts/prepare-dist.mjs",
+    "build": "tsc --noCheck && node scripts/prepare-dist.mjs",
     "typecheck": "tsc --noEmit",
     "dev": "python3 -m http.server 4173"
   },
