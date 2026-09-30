@@ -335,7 +335,8 @@ function makeTtml(){
   const lyrics=($('lyrics') as HTMLInputElement).value.trim(); const words=(lyrics?lyrics.split(/\s+/):['Generated','timing','will','be','inserted']).slice(0,48); const duration=Math.max(1,backing?.stats?.duration??lead?.stats?.duration??4); const step=(duration*1000)/words.length;
   const spans=words.map((w,i)=>`        <span begin="${toTime(i*step)}" end="${toTime((i+1)*step)}">${escapeHtml(w)}</span>`).join(' ');
   const bgOn=qs<HTMLButtonElement>('[data-toggle="bg"]').classList.contains('on'); const v2On=qs<HTMLButtonElement>('[data-toggle="v2"]').classList.contains('on'); const partsOn=qs<HTMLButtonElement>('[data-toggle="parts"]').classList.contains('on');
-  const bgStart=toTime(step*1.2); const bgEnd=toTime(Math.min(duration*1000,step*(words.length>2?2.5:2)));\n  const bg=v2On&&bgOn?`\n        <span ttm:role="x-bg" begin="${bgStart}" end="${bgEnd}" ttm:agent="v2">background</span>`:'';
+  const bgStart=toTime(step*1.2); const bgEnd=toTime(Math.min(duration*1000,step*(words.length>2?2.5:2)));
+  const bg=v2On&&bgOn?`\n        <span ttm:role="x-bg" begin="${bgStart}" end="${bgEnd}" ttm:agent="v2">background</span>`:'';
   const part=partsOn?'\n    <div itunes:song-part="Verse">':'\n    <div>'; const closePart='\n    </div>';
   return `<?xml version="1.0" encoding="UTF-8"?>\n<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata" xmlns:itunes="http://music.apple.com/lyric-ttml-internal" xml:lang="${lang}" itunes:timing="Word">\n  <head>\n    <metadata>\n      <ttm:title>${title}</ttm:title>\n      <ttm:agent type="person" xml:id="v1"><ttm:name type="full">${artist}</ttm:name></ttm:agent>${v2On?'\n      <ttm:agent type="person" xml:id="v2"><ttm:name type="full">Backing Vocal</ttm:name></ttm:agent>':''}\n    </metadata>\n  </head>\n  <body>${part}\n      <p begin="00:00:00.000" end="${toTime(duration*1000)}" ttm:agent="v1">\n${spans}${bg}\n      </p>${closePart}\n  </body>\n</tt>`;
 }
