@@ -1,0 +1,9 @@
+{
+  "model": "tiny-stem-purity-classifier",
+  "deployment": "client",
+  "target": "low-end CPU",
+  "quantization": "int8",
+  "classes": ["lead", "backing", "reject"],
+  "policy": "reject ambiguous or mixed audio",
+  "features": ["rms", "zcr", "centroid", "flatness", "low_ratio", "harmonicity"]
+}
