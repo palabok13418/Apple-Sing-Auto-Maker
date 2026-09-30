@@ -171,7 +171,89 @@ $('bgChoose').addEventListener('click', () => $('bgFile').click());
 $('eco').addEventListener('click', () => { $('eco').classList.toggle('on'); $('profile').textContent = $('eco').classList.contains('on') ? 'eco' : 'balanced'; });
 document.querySelectorAll('.switch[data-toggle]').forEach(b => b.addEventListener('click', () => b.classList.toggle('on')));
 const runtimeNavigator = navigator; $('webnn').textContent = runtimeNavigator.ml?.createContext ? 'available' : 'not exposed · CPU path'; $('cores').textContent = String(navigator.hardwareConcurrency || '—'); $('memoryHint').textContent = navigator.deviceMemory ? `${navigator.deviceMemory} GB hint` : 'unavailable'; $('gpuStatus').textContent = runtimeNavigator.ml?.createContext && runtimeNavigator.gpu?.requestAdapter ? 'ready' : 'unavailable';
-async function setGpu(on) { const nav = navigator; if (!on) { gpuDevice?.destroy?.(); gpuDevice = null; webnnContext = null; settings.gpu = false; $('gpuStatus').textContent = 'off'; refreshProfile(); return; } if (!nav.ml?.createContext || !nav.gpu?.requestAdapter) { $('gpuToggle').classList.remove('on'); $('gpuToggle').setAttribute('aria-pressed', 'false'); settings.gpu = false; $('gpuStatus').textContent = 'unavailable'; log('gpu: WebGPU/WebNN is not available; staying on CPU.'); refreshProfile(); return; } try { const adapter = await nav.gpu.requestAdapter(); const device = await adapter?.requestDevice?.(); if (!device) throw new Error('No GPU device was granted.'); webnnContext = await nav.ml.createContext(device); gpuDevice = device; settings.gpu = true; $('gpuStatus').textContent = 'active'; log('gpu: GPU-backed WebNN context ready for ML inference.'); } catch (err) { gpuDevice?.destroy?.(); gpuDevice = null; webnnContext = null; settings.gpu = false; $('gpuToggle').classList.remove('on'); $('gpuToggle').setAttribute('aria-pressed', 'false'); $('gpuStatus').textContent = 'fallback CPU'; log('gpu: setup failed • ' + (err instanceof Error ? err.message : 'unknown error')); } refreshProfile(); }
+async function probeWebGpu() {
+    const nav = navigator;
+    if (!nav.gpu?.requestAdapter)
+        return null;
+    const adapter = await nav.gpu.requestAdapter();
+    if (!adapter?.requestDevice)
+        return null;
+    const device = await adapter.requestDevice();
+    if (!device)
+        return null;
+    const shader = device.createShaderModule?.({ code: `
+    @group(0) @binding(0) var<storage,read_write> data: array<f32>;
+    @compute @workgroup_size(1)
+    fn main() {
+      data[0] = data[0] * 2.0;
+    }
+  ` });
+    if (shader && device.createBuffer && device.createBindGroupLayout && device.createPipeline) {
+        const buffer = device.createBuffer({ size: 16, usage: 0x80 | 0x08 });
+        const staging = device.createBuffer({ size: 16, usage: 0x01 | 0x08 });
+        const layout = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: 4, buffer: { type: "storage" } }] });
+        const pipeline = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }), compute: { module: shader, entryPoint: "main" } });
+        const bindGroup = device.createBindGroup({ layout, entries: [{ binding: 0, resource: { buffer } }] });
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(1);
+        pass.end();
+        encoder.copyBufferToBuffer(buffer, 0, staging, 0, 16);
+        device.queue.submit([encoder.finish()]);
+        await device.queue.onSubmittedWorkDone?.();
+        buffer.destroy?.();
+        staging.destroy?.();
+    }
+    return { device, adapter };
+}
+async function setGpu(on) {
+    const nav = navigator;
+    if (!on) {
+        gpuDevice?.destroy?.();
+        gpuDevice = null;
+        webnnContext = null;
+        settings.gpu = false;
+        $("gpuStatus").textContent = "off";
+        refreshProfile();
+        return;
+    }
+    try {
+        const gpu = await probeWebGpu();
+        if (!gpu)
+            throw new Error("WebGPU is not available or could not create a device.");
+        gpuDevice = gpu.device;
+        if (nav.ml?.createContext) {
+            try {
+                webnnContext = await nav.ml.createContext(gpu.device);
+                log("gpu: WebGPU compute device ready; WebNN ML context also available.");
+            }
+            catch {
+                webnnContext = null;
+                log("gpu: WebGPU compute device ready; WebNN ML context unavailable, using GPU compute path.");
+            }
+        }
+        else {
+            webnnContext = null;
+            log("gpu: WebGPU compute device ready; WebNN is not exposed in this browser.");
+        }
+        settings.gpu = true;
+        $("gpuStatus").textContent = "active";
+    }
+    catch (err) {
+        gpuDevice?.destroy?.();
+        gpuDevice = null;
+        webnnContext = null;
+        settings.gpu = false;
+        $("gpuToggle").classList.remove("on");
+        $("gpuToggle").setAttribute("aria-pressed", "false");
+        $("gpuStatus").textContent = "unavailable";
+        log("gpu: " + (err instanceof Error ? err.message : "unknown GPU setup error") + "; CPU remains active.");
+    }
+    refreshProfile();
+}
+
 function refreshProfile() { $('profile').textContent = (settings.cpu ? 'CPU DSP' : 'CPU off') + ' · ' + (settings.gpu ? 'GPU ML' : 'GPU off') + ' · ' + (settings.adaptive ? 'adaptive' : 'fixed') + ' · ' + (settings.cache ? 'cache' : 'no cache'); $('topProfile').textContent = settings.gpu ? 'GPU-assisted' : 'CPU-first'; $('cpuStatus').textContent = settings.cpu ? 'optimized' : 'off'; }
 $('cpuToggle').addEventListener('click', () => { settings.cpu = $('cpuToggle').classList.toggle('on'); $('cpuToggle').setAttribute('aria-pressed', String(settings.cpu)); if (!settings.cpu) { passed = false; $('generate').setAttribute('disabled', 'true'); setGate('wait', 'CPU analysis is off. The current DSP path still requires CPU feature extraction.'); } refreshProfile(); });
 $('gpuToggle').addEventListener('click', async () => { const on = $('gpuToggle').classList.toggle('on'); $('gpuToggle').setAttribute('aria-pressed', String(on)); await setGpu(on); });
