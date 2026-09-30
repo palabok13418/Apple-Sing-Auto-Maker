@@ -206,8 +206,6 @@ async function analyzeSlot(slot:FileSlot,label:string,base:number,span:number){
 
 bindInput('leadFile','leadCard','leadMeta',f=>lead={file:f});
 bindInput('bgFile','bgCard','bgMeta',f=>backing={file:f});
-$('leadChoose').addEventListener('click',()=>($('leadFile') as HTMLInputElement).click());
-$('bgChoose').addEventListener('click',()=>($('bgFile') as HTMLInputElement).click());
 $('eco').addEventListener('click',()=>{$('eco').classList.toggle('on');$('profile').textContent=$('eco').classList.contains('on')?'eco':'balanced';});
 document.querySelectorAll<HTMLButtonElement>('.switch[data-toggle]').forEach(b=>b.addEventListener('click',()=>b.classList.toggle('on')));
 const runtimeNavigator=navigator as Navigator & {ml?:any;gpu?:any};
