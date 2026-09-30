@@ -1,5 +1,6 @@
 type AudioInterval = {start:number; end:number};
-type AudioStats = {duration:number; sampleRate:number; channels:number; rms:number; zcr:number; centroid:number; flatness:number; lowRatio:number; harmonicity:number; secondaryVoice:number; secondaryVoicePeak:number; vocalActivity:number; vocalCoverage:number; secondaryIntervals:AudioInterval[]; vocalIntervals:AudioInterval[]};
+type AudioPeak = {time:number; strength:number};
+type AudioStats = {duration:number; sampleRate:number; channels:number; rms:number; zcr:number; centroid:number; flatness:number; lowRatio:number; harmonicity:number; secondaryVoice:number; secondaryVoicePeak:number; vocalActivity:number; vocalCoverage:number; secondaryIntervals:AudioInterval[]; vocalIntervals:AudioInterval[]; syllablePeaks:AudioPeak[]; backingPeaks:AudioPeak[]};
 type FileSlot = {file:File; stats?:AudioStats; score?:number};
 
 const $ = <T extends HTMLElement>(id:string):T => { const node=document.getElementById(id); if(!node) throw new Error('UI element not found: #'+id); return node as T; };
@@ -120,66 +121,126 @@ function normalizeIntervals(intervals:AudioInterval[],durationSeconds:number,gap
     .map(x=>({start:Math.max(0,x.start),end:Math.max(Math.max(0,x.start),Math.min(durationSeconds,x.end))}))
     .filter(x=>x.end-x.start>=.04);
 }
-function extractVocalIntervals(samples:Float32Array,sampleRate:number):{intervals:AudioInterval[];coverage:number}{
-  // Lightweight envelope pass for lyric-line alignment. It uses RMS + zero-crossing
-  // rate rather than another expensive FFT, so low-end machines can scan the full song.
-  const frame=Math.max(512,Math.round(sampleRate*.12));
+function extractVocalIntervals(samples:Float32Array,sampleRate:number):{intervals:AudioInterval[];coverage:number;peaks:AudioPeak[];scores:Float32Array}{
+  // Frame-level audio analysis: energy, ZCR and local voicing shape are used to
+  // create real phrase and syllable timing anchors.
+  const frame=Math.max(1024,Math.round(sampleRate*.08));
   const frames=Math.max(1,Math.ceil(samples.length/frame));
-  const rmsValues=new Float32Array(frames); const zcrValues=new Float32Array(frames);
+  const rmsValues=new Float32Array(frames);
+  const zcrValues=new Float32Array(frames);
+  const scores=new Float32Array(frames);
   let maxRms=0;
   for(let f=0;f<frames;f++){
-    const start=f*frame; const end=Math.min(samples.length,start+frame); let energy=0; let zcr=0;
-    for(let i=start;i<end;i++){const x=samples[i]??0;energy+=x*x;if(i>start&&((samples[i-1]??0)>=0)!=(x>=0))zcr++;}
-    const count=Math.max(1,end-start); const rms=Math.sqrt(energy/count); rmsValues[f]=rms; zcrValues[f]=zcr/count; maxRms=Math.max(maxRms,rms);
+    const start=f*frame; const end=Math.min(samples.length,start+frame);
+    let energy=0,zcr=0;
+    for(let i=start;i<end;i++){
+      const x=samples[i]??0; energy+=x*x;
+      if(i>start&&((samples[i-1]??0)>=0)!=(x>=0))zcr++;
+    }
+    const count=Math.max(1,end-start);
+    const rms=Math.sqrt(energy/count);
+    rmsValues[f]=rms; zcrValues[f]=zcr/count; maxRms=Math.max(maxRms,rms);
   }
-  const sorted=[...rmsValues].sort((a,b)=>a-b); const q20=sorted[Math.floor((sorted.length-1)*.20)]??0;
-  const threshold=Math.max(.004,q20*2.2,maxRms*.12); const active:boolean[]=[]; let activeCount=0;
+  const sorted=[...rmsValues].sort((a,b)=>a-b);
+  const q20=sorted[Math.floor((sorted.length-1)*.20)]??0;
+  const q50=sorted[Math.floor((sorted.length-1)*.50)]??0;
+  const threshold=Math.max(.003,q20*1.65,maxRms*.10);
   for(let f=0;f<frames;f++){
     const normalized=rmsValues[f]/Math.max(maxRms,1e-6);
-    const voiced=normalized>=.12&&(rmsValues[f]>=threshold||normalized>=.28)&&zcrValues[f]<.45;
-    active[f]=voiced; if(voiced)activeCount++;
+    const energyScore=clamp01((rmsValues[f]-threshold)/Math.max(.001,maxRms-threshold));
+    const zcrScore=clamp01(1-zcrValues[f]/.42);
+    const localFloor=rmsValues[f]>=Math.max(threshold,q50*.72);
+    scores[f]=clamp01(energyScore*.56+zcrScore*.16+(localFloor?.18:0)+normalized*.10);
   }
-  // Fill tiny holes and reject isolated one-frame spikes.
-  for(let f=1;f<frames-1;f++){if(!active[f]&&!active[f-1]&&active[f+1])active[f]=true;if(active[f]&&!active[f-1]&&!active[f+1])active[f]=false;}
-  const raw:AudioInterval[]=[]; let start=-1;
+  const active=scores.map((score,f)=>score>=.38&&rmsValues[f]>=threshold&&zcrValues[f]<.48);
+  for(let f=1;f<frames-1;f++){
+    if(!active[f]&&active[f-1]&&active[f+1]&&scores[f]>=.25)active[f]=true;
+    if(active[f]&&!active[f-1]&&!active[f+1]&&scores[f]<.58)active[f]=false;
+  }
+  const raw:AudioInterval[]=[]; let startFrame=-1;
   for(let f=0;f<frames;f++){
-    if(active[f]&&start<0)start=f;
-    const closing=(!active[f]&&start>=0)||f===frames-1;
-    if(closing){const endFrame=!active[f]?f:f+1;const a=start*frame/sampleRate;const b=Math.min(samples.length/sampleRate,endFrame*frame/sampleRate);if(b-a>=.12)raw.push({start:a,end:b});start=-1;}
+    if(active[f]&&startFrame<0)startFrame=f;
+    const closing=(!active[f]&&startFrame>=0)||f===frames-1;
+    if(closing){
+      const endFrame=!active[f]?f:f+1;
+      const a=startFrame*frame/sampleRate;
+      const b=Math.min(samples.length/sampleRate,endFrame*frame/sampleRate);
+      if(b-a>=.10)raw.push({start:a,end:b});
+      startFrame=-1;
+    }
   }
-  const intervals=normalizeIntervals(raw,samples.length/Math.max(1,sampleRate),.24);
+  const intervals=normalizeIntervals(raw,samples.length/Math.max(1,sampleRate),.16);
+  const peaks:AudioPeak[]=[];
+  const minPeakGap=Math.max(2,Math.round(.11*sampleRate/frame));
+  for(const interval of intervals){
+    const a=Math.max(1,Math.floor(interval.start*sampleRate/frame));
+    const b=Math.min(frames-2,Math.ceil(interval.end*sampleRate/frame));
+    let lastPeak=-9999;
+    for(let f=a;f<=b;f++){
+      const prev=scores[f-1],cur=scores[f],next=scores[f+1];
+      if(cur>=prev&&cur>=next&&cur>=.48&&f-lastPeak>=minPeakGap){
+        const strength=clamp01(cur*.72+(cur-Math.min(prev,next))*.90);
+        if(strength>=.50){peaks.push({time:(f+.5)*frame/sampleRate,strength});lastPeak=f;}
+      }
+    }
+  }
+  const reduced:AudioPeak[]=[];
+  for(const peak of peaks.sort((a,b)=>a.time-b.time)){
+    const last=reduced[reduced.length-1];
+    if(!last||peak.time-last.time>=.13)reduced.push(peak);
+    else if(peak.strength>last.strength)reduced[reduced.length-1]=peak;
+  }
   const covered=intervals.reduce((n,x)=>n+Math.max(0,x.end-x.start),0);
-  return {intervals,coverage:clamp01(covered/Math.max(1,samples.length/sampleRate))};
+  return {intervals,coverage:clamp01(covered/Math.max(1,samples.length/sampleRate)),peaks:reduced,scores};
 }
-
 
 async function inspect(file:File,onProgress:(value:number)=>void=(/*value*/)=>{}):Promise<AudioStats|null>{
   if(!settings.cpu)throw new Error('CPU analysis is disabled. Turn CPU analysis back on to run the current DSP path.');
   try{
     const ctx=await getAudioContext(); if(!ctx)return null;
-    const buffer=await ctx.decodeAudioData(await file.arrayBuffer()); const plan=getAnalysisPlan(buffer.duration); const key=fileKey(file,plan);
+    const buffer=await ctx.decodeAudioData(await file.arrayBuffer());
+    const plan=getAnalysisPlan(buffer.duration);
+    const key=fileKey(file,plan);
     if(settings.cache){const cached=analysisCache.get(key);if(cached){onProgress(1);return cached;}}
-    const ch=buffer.getChannelData(0); const step=Math.max(1,Math.floor(ch.length/plan.windows));
+    const ch=buffer.getChannelData(0);
+    const step=Math.max(1,Math.floor(ch.length/plan.windows));
     let acc={rms:0,zcr:0,centroid:0,flatness:0,lowRatio:0,harmonicity:0,secondaryVoice:0,vocalActivity:0,vocalCoverage:0};
-    const secondaryIntervals:AudioInterval[]=[]; const vocalIntervals:AudioInterval[]=[]; let secondaryVoicePeak=0; let count=0;
+    const secondaryIntervals:AudioInterval[]=[];
+    let secondaryVoicePeak=0;
+    let count=0;
     for(let w=0;w<plan.windows;w++){
-      const center=Math.min(ch.length-1,Math.floor((w+.5)*step)); const half=Math.min(1024,Math.max(128,Math.floor(step/2))); const start=Math.max(0,center-half); const end=Math.min(ch.length,start+Math.max(256,half*2)); const slice=ch.subarray(start,end);
+      const center=Math.min(ch.length-1,Math.floor((w+.5)*step));
+      const half=Math.min(1024,Math.max(128,Math.floor(step/2)));
+      const start=Math.max(0,center-half);
+      const end=Math.min(ch.length,start+Math.max(256,half*2));
+      const slice=ch.subarray(start,end);
       if(slice.length>=64){
         const f=fftLike(slice,buffer.sampleRate,plan.fftSize);
-        for(const k of Object.keys(acc) as Array<keyof typeof acc>)acc[k]+=f[k]; count++;
+        for(const k of Object.keys(acc) as Array<keyof typeof acc>)acc[k]+=f[k];
+        count++;
         secondaryVoicePeak=Math.max(secondaryVoicePeak,f.secondaryVoice);
         const interval={start:start/buffer.sampleRate,end:end/buffer.sampleRate};
         if(f.secondaryVoice>=.62)secondaryIntervals.push(interval);
-        if(f.vocalActivity>=.48)vocalIntervals.push(interval);
       }
-      onProgress((w+1)/plan.windows); await yieldToUi();
+      onProgress((w+1)/plan.windows);
+      await yieldToUi();
     }
     for(const k of Object.keys(acc) as Array<keyof typeof acc>)acc[k]/=Math.max(1,count);
     const timing=extractVocalIntervals(ch,buffer.sampleRate);
-    const stats:AudioStats={duration:buffer.duration,sampleRate:buffer.sampleRate,channels:buffer.numberOfChannels,...acc,secondaryVoicePeak,vocalCoverage:timing.coverage,secondaryIntervals:normalizeIntervals(secondaryIntervals,buffer.duration,.12),vocalIntervals:timing.intervals};
-    if(settings.cache)analysisCache.set(key,stats); return stats;
+    const stats:AudioStats={
+      duration:buffer.duration,sampleRate:buffer.sampleRate,channels:buffer.numberOfChannels,...acc,
+      secondaryVoicePeak,
+      vocalCoverage:timing.coverage,
+      secondaryIntervals:normalizeIntervals(secondaryIntervals,buffer.duration,.12),
+      vocalIntervals:timing.intervals,
+      syllablePeaks:timing.peaks,
+      backingPeaks:timing.peaks
+    };
+    if(settings.cache)analysisCache.set(key,stats);
+    return stats;
   }catch(err){if(err instanceof Error)throw err;return null;}
-}function decodeCommonEntities(text:string):string{
+}
+function decodeCommonEntities(text:string):string{
   return text.replace(/&amp;/gi,'&').replace(/&quot;/gi,'"').replace(/&#39;/gi,"'").replace(/&lt;/gi,'<').replace(/&gt;/gi,'>');
 }
 function getLyricLines():string[]{
