@@ -1,4 +1,5 @@
-type AudioStats = {duration:number; sampleRate:number; channels:number; rms:number; zcr:number; centroid:number; flatness:number; lowRatio:number; harmonicity:number};
+type AudioInterval = {start:number; end:number};
+type AudioStats = {duration:number; sampleRate:number; channels:number; rms:number; zcr:number; centroid:number; flatness:number; lowRatio:number; harmonicity:number; secondaryVoice:number; vocalActivity:number; secondaryIntervals:AudioInterval[]; vocalIntervals:AudioInterval[]};
 type FileSlot = {file:File; stats?:AudioStats; score?:number};
 
 const $ = <T extends HTMLElement>(id:string):T => { const node=document.getElementById(id); if(!node) throw new Error('UI element not found: #'+id); return node as T; };
@@ -28,95 +29,54 @@ function bindInput(inputId:string,cardId:string,metaId:string,assign:(f:File)=>v
   card.addEventListener('drop',e=>{e.preventDefault();card.classList.remove('drag');const f=e.dataTransfer?.files?.[0];if(!f)return;assign(f);showFile(inputId==='leadFile'?'lead':'backing',f);card.classList.remove('good','bad');passed=false;setGate('wait',lead&&backing?'Both stems loaded. Analyze them to continue.':'Waiting for both files.');$('generate').setAttribute('disabled','true');});
 }
 
-function fftLike(samples:Float32Array,sampleRate:number,maxFft=2048):Pick<AudioStats,'rms'|'zcr'|'centroid'|'flatness'|'lowRatio'|'harmonicity'>{
-  // Radix-2 FFT: replaces the old O(N²) DFT with O(N log N) work.
+function clamp01(n:number){return Math.max(0,Math.min(1,n));}
+
+function fftLike(samples:Float32Array,sampleRate:number,maxFft=2048):Pick<AudioStats,'rms'|'zcr'|'centroid'|'flatness'|'lowRatio'|'harmonicity'|'secondaryVoice'|'vocalActivity'>{
   const limit=Math.min(samples.length,maxFft);
   const n=Math.max(64,1<<Math.floor(Math.log2(Math.max(64,limit))));
   const re=new Float32Array(n);
   const im=new Float32Array(n);
-  let rms=0;
-  let zcr=0;
-
+  let rms=0; let zcr=0;
   for(let i=0;i<n;i++){
     const x=samples[i]??0;
     const window=.5*(1-Math.cos(2*Math.PI*i/Math.max(1,n-1)));
-    re[i]=x*window;
-    rms+=x*x;
+    re[i]=x*window; rms+=x*x;
     if(i>0&&((samples[i-1]??0)>=0)!=(x>=0))zcr++;
   }
-  rms=Math.sqrt(rms/Math.max(1,n));
-  zcr/=Math.max(1,n);
-
-  for(let i=1,j=0;i<n;i++){
-    let bit=n>>1;
-    for(;j&bit;bit>>=1)j^=bit;
-    j^=bit;
-    if(i<j){
-      const tr=re[i];re[i]=re[j];re[j]=tr;
-      const ti=im[i];im[i]=im[j];im[j]=ti;
-    }
-  }
-
-  for(let size=2;size<=n;size<<=1){
-    const half=size>>1;
-    const step=-2*Math.PI/size;
-    for(let start=0;start<n;start+=size){
-      for(let j=0;j<half;j++){
-        const angle=step*j;
-        const wr=Math.cos(angle);
-        const wi=Math.sin(angle);
-        const i=start+j;
-        const k=i+half;
-        const tr=wr*re[k]-wi*im[k];
-        const ti=wr*im[k]+wi*re[k];
-        re[k]=re[i]-tr;
-        im[k]=im[i]-ti;
-        re[i]+=tr;
-        im[i]+=ti;
-      }
-    }
-  }
-
-  const bins=n>>1;
-  let total=0;
-  let weighted=0;
-  let low=0;
-  let logSum=0;
-  for(let k=0;k<bins;k++){
-    const freq=k*sampleRate/n;
-    const mag=Math.hypot(re[k],im[k]);
-    total+=mag;
-    weighted+=freq*mag;
-    if(freq<=300)low+=mag;
-    logSum+=Math.log(mag+1e-12);
-  }
-
+  rms=Math.sqrt(rms/Math.max(1,n)); zcr/=Math.max(1,n);
+  for(let i=1,j=0;i<n;i++){let bit=n>>1;for(;j&bit;bit>>=1)j^=bit;j^=bit;if(i<j){const tr=re[i];re[i]=re[j];re[j]=tr;const ti=im[i];im[i]=im[j];im[j]=ti;}}
+  for(let size=2;size<=n;size<<=1){const half=size>>1;const step=-2*Math.PI/size;for(let start=0;start<n;start+=size){for(let j=0;j<half;j++){const angle=step*j;const wr=Math.cos(angle);const wi=Math.sin(angle);const i=start+j;const k=i+half;const tr=wr*re[k]-wi*im[k];const ti=wr*im[k]+wi*re[k];re[k]=re[i]-tr;im[k]=im[i]-ti;re[i]+=tr;im[i]+=ti;}}}
+  const bins=n>>1; let total=0,weighted=0,low=0,logSum=0;
+  for(let k=0;k<bins;k++){const freq=k*sampleRate/n;const mag=Math.hypot(re[k],im[k]);total+=mag;weighted+=freq*mag;if(freq<=300)low+=mag;logSum+=Math.log(mag+1e-12);}
   const nyquist=Math.max(1,sampleRate/2);
   const centroid=total?Math.min(1,weighted/total/nyquist):0;
   const arith=total/Math.max(1,bins)+1e-12;
   const geo=Math.exp(logSum/Math.max(1,bins));
   const flatness=Math.max(0,Math.min(1,geo/arith));
   const lowRatio=total?low/total:0;
-
-  let harmonicity=0;
-  const minLag=Math.max(2,Math.floor(sampleRate/500));
-  const maxLag=Math.min(Math.floor(sampleRate/70),Math.floor(n/2));
+  const candidates:Array<{freq:number;score:number}>=[]; let harmonicity=0;
+  const minLag=Math.max(2,Math.floor(sampleRate/500)); const maxLag=Math.min(Math.floor(sampleRate/70),Math.floor(n/2));
   if(rms>1e-4&&maxLag>minLag){
     for(let lag=minLag;lag<=maxLag;lag+=4){
       let corr=0,ea=0,eb=0;
-      for(let i=0;i<n-lag;i++){
-        const a=samples[i]??0;
-        const b=samples[i+lag]??0;
-        corr+=a*b;
-        ea+=a*a;
-        eb+=b*b;
-      }
-      const normalized=corr/Math.sqrt((ea+1e-12)*(eb+1e-12));
-      harmonicity=Math.max(harmonicity,Math.max(0,normalized));
+      for(let i=0;i<n-lag;i++){const a=samples[i]??0;const b=samples[i+lag]??0;corr+=a*b;ea+=a*a;eb+=b*b;}
+      const normalized=Math.max(0,corr/Math.sqrt((ea+1e-12)*(eb+1e-12)));
+      harmonicity=Math.max(harmonicity,normalized);
+      if(normalized>.12)candidates.push({freq:sampleRate/lag,score:normalized});
     }
   }
-
-  return {rms,zcr,centroid,flatness,lowRatio,harmonicity};
+  candidates.sort((a,b)=>b.score-a.score);
+  const primary=candidates[0]; let secondary:{freq:number;score:number}|undefined;
+  if(primary){
+    for(const candidate of candidates.slice(1)){
+      const ratio=candidate.freq/primary.freq; const absSemi=Math.abs(12*Math.log2(Math.max(1e-6,ratio)));
+      const harmonicRatio=Math.abs(ratio-2)<.08||Math.abs(ratio-3)<.10||Math.abs(ratio-4)<.12||Math.abs(ratio-.5)<.03||Math.abs(ratio-1/3)<.03||Math.abs(ratio-.25)<.025||Math.abs(ratio-1.5)<.05||Math.abs(ratio-4/3)<.05;
+      if(absSemi>=2.5&&!harmonicRatio&&candidate.score>=primary.score*.68){secondary=candidate;break;}
+    }
+  }
+  const secondaryVoice=primary&&secondary?clamp01(((secondary.score/Math.max(.01,primary.score))-.58)/.42)*clamp01((primary.score-.18)/.52):0;
+  const vocalActivity=clamp01(harmonicity*.72+Math.min(1,rms*24)*.18+(1-flatness)*.10);
+  return {rms,zcr,centroid,flatness,lowRatio,harmonicity,secondaryVoice,vocalActivity};
 }
 
 async function getAudioContext(){
@@ -139,46 +99,60 @@ function yieldToUi(){
   if(!settings.responsive)return Promise.resolve();
   return new Promise<void>(resolve=>requestAnimationFrame(()=>resolve()));
 }
+function mergeIntervals(intervals:AudioInterval[],gap=.35):AudioInterval[]{
+  if(!intervals.length)return [];
+  const sorted=[...intervals].sort((a,b)=>a.start-b.start);
+  const merged:AudioInterval[]=[{start:sorted[0].start,end:sorted[0].end}];
+  for(const next of sorted.slice(1)){const last=merged[merged.length-1];if(next.start<=last.end+gap)last.end=Math.max(last.end,next.end);else merged.push({start:next.start,end:next.end});}
+  return merged;
+}
+
 async function inspect(file:File,onProgress:(value:number)=>void=(/*value*/)=>{}):Promise<AudioStats|null>{
   if(!settings.cpu)throw new Error('CPU analysis is disabled. Turn CPU analysis back on to run the current DSP path.');
   try{
-    const ctx=await getAudioContext();
-    if(!ctx)return null;
-    const buffer=await ctx.decodeAudioData(await file.arrayBuffer());
-    const plan=getAnalysisPlan(buffer.duration);
-    const key=fileKey(file,plan);
-    if(settings.cache){
-      const cached=analysisCache.get(key);
-      if(cached){onProgress(1);return cached;}
-    }
-    const ch=buffer.getChannelData(0);
-    const step=Math.max(1,Math.floor(ch.length/plan.windows));
-    let acc={rms:0,zcr:0,centroid:0,flatness:0,lowRatio:0,harmonicity:0};
-    let count=0;
+    const ctx=await getAudioContext(); if(!ctx)return null;
+    const buffer=await ctx.decodeAudioData(await file.arrayBuffer()); const plan=getAnalysisPlan(buffer.duration); const key=fileKey(file,plan);
+    if(settings.cache){const cached=analysisCache.get(key);if(cached){onProgress(1);return cached;}}
+    const ch=buffer.getChannelData(0); const step=Math.max(1,Math.floor(ch.length/plan.windows));
+    let acc={rms:0,zcr:0,centroid:0,flatness:0,lowRatio:0,harmonicity:0,secondaryVoice:0,vocalActivity:0};
+    const secondaryIntervals:AudioInterval[]=[]; const vocalIntervals:AudioInterval[]=[]; let count=0;
     for(let w=0;w<plan.windows;w++){
-      const center=Math.min(ch.length-1,Math.floor((w+.5)*step));
-      const half=Math.min(1024,Math.max(128,Math.floor(step/2)));
-      const start=Math.max(0,center-half);
-      const end=Math.min(ch.length,start+Math.max(256,half*2));
-      const slice=ch.subarray(start,end);
+      const center=Math.min(ch.length-1,Math.floor((w+.5)*step)); const half=Math.min(1024,Math.max(128,Math.floor(step/2))); const start=Math.max(0,center-half); const end=Math.min(ch.length,start+Math.max(256,half*2)); const slice=ch.subarray(start,end);
       if(slice.length>=64){
-        const f=fftLike(slice,buffer.sampleRate);
-        for(const k of Object.keys(acc) as Array<keyof typeof acc>)acc[k]+=f[k];
-        count++;
+        const f=fftLike(slice,buffer.sampleRate,plan.fftSize);
+        for(const k of Object.keys(acc) as Array<keyof typeof acc>)acc[k]+=f[k]; count++;
+        const interval={start:start/buffer.sampleRate,end:end/buffer.sampleRate}; if(f.secondaryVoice>=.58)secondaryIntervals.push(interval); if(f.vocalActivity>=.48)vocalIntervals.push(interval);
       }
-      onProgress((w+1)/plan.windows);
-      await yieldToUi();
+      onProgress((w+1)/plan.windows); await yieldToUi();
     }
     for(const k of Object.keys(acc) as Array<keyof typeof acc>)acc[k]/=Math.max(1,count);
-    const stats={duration:buffer.duration,sampleRate:buffer.sampleRate,channels:buffer.numberOfChannels,...acc};
-    if(settings.cache)analysisCache.set(key,stats);
-    return stats;
-  }catch(err){
-    if(err instanceof Error)throw err;
-    return null;
-  }
+    const stats:AudioStats={duration:buffer.duration,sampleRate:buffer.sampleRate,channels:buffer.numberOfChannels,...acc,secondaryIntervals:mergeIntervals(secondaryIntervals),vocalIntervals:mergeIntervals(vocalIntervals)};
+    if(settings.cache)analysisCache.set(key,stats); return stats;
+  }catch(err){if(err instanceof Error)throw err;return null;}
 }
-
+function splitSyllables(word:string,lang:string):string[]{
+  if(!word)return [];
+  const graphemes=[...word];
+  const isSmallKana=(c:string)=>/^[ぁぃぅぇぉゃゅょゎっァィゥェォャュョヮッ]$/u.test(c);
+  if(/^ja(?:-|$)/u.test(lang)){const out:string[]=[];for(const c of graphemes){if(isSmallKana(c)&&out.length)out[out.length-1]+=c;else out.push(c);}return out;}
+  if(/^ko(?:-|$)/u.test(lang)||/^zh(?:-|$)/u.test(lang))return graphemes;
+  const leading=(word.match(/^[^\p{L}\p{N}]*/u)?.[0]??''); const trailing=(word.match(/[^\p{L}\p{N}]*$/u)?.[0]??''); const core=word.slice(leading.length,Math.max(leading.length,word.length-trailing.length));
+  if(!core)return [word];
+  const groups=core.match(/[^aeiouy]*[aeiouy]+(?:[^aeiouy](?=[^aeiouy]+)|$)/giu)??[core]; const syllables=groups.filter(Boolean); if(!syllables.length)return [word];
+  syllables[0]=leading+syllables[0]; syllables[syllables.length-1]+=trailing; return syllables;
+}
+type SyllableUnit={text:string;begin:number;end:number;wordIndex:number};
+function buildSyllableTimeline(words:string[],durationMs:number,lang:string):SyllableUnit[]{
+  const result:SyllableUnit[]=[]; const total=Math.max(1,words.length);
+  for(let i=0;i<words.length;i++){const wordStart=durationMs*i/total; const wordEnd=durationMs*(i+1)/total; const syllables=splitSyllables(words[i],lang); const weights=syllables.map(x=>Math.max(1,[...x].filter(c=>/[\p{L}\p{N}]/u.test(c)).length)); const sum=weights.reduce((a,b)=>a+b,0)||1; let cursor=wordStart;
+    for(let j=0;j<syllables.length;j++){const end=j===syllables.length-1?wordEnd:cursor+(wordEnd-wordStart)*weights[j]/sum; result.push({text:syllables[j],begin:cursor,end,wordIndex:i}); cursor=end;}
+  }
+  return result;
+}
+function unitOverlaps(unit:SyllableUnit,intervals:AudioInterval[]):boolean{return intervals.some(x=>unit.begin/1000<x.end&&unit.end/1000>x.start);}
+function renderSyllables(units:SyllableUnit[],markV2:boolean,intervals:AudioInterval[]):string{
+  return units.map((u,i)=>{const mark=markV2&&unitOverlaps(u,intervals)?' ttm:agent="v2"':'';const next=units[i+1];const spacer=next&&next.wordIndex!==u.wordIndex?' ':'';return '<span begin="'+toTime(u.begin)+'" end="'+toTime(u.end)+'"'+mark+'>'+escapeHtml(u.text)+'</span>'+spacer;}).join('');
+}
 function classify(s:AudioStats):number{
   // This is still an admission heuristic until the trained tiny model is
   // shipped. It is deliberately calibrated around sung-voice characteristics
@@ -200,6 +174,7 @@ async function analyzeSlot(slot:FileSlot,label:string,base:number,span:number){
   slot.stats=stats;
   slot.score=classify(stats);
   log(label+': '+stats.duration.toFixed(2)+'s • '+stats.sampleRate+' Hz • '+stats.channels+'ch • confidence '+(slot.score*100).toFixed(1)+'%');
+  log(label+': vocal activity '+(stats.vocalActivity*100).toFixed(0)+'% • second-voice signal '+(stats.secondaryVoice*100).toFixed(0)+'%');
   log(label+': plan • '+getAnalysisPlan(stats.duration).windows+' windows / '+plan.fftSize+'-point FFT');
   return slot.score;
 }
@@ -311,17 +286,14 @@ $('analyze').addEventListener('click',async()=>{
   $('analyze').setAttribute('disabled','true'); $('generate').setAttribute('disabled','true'); setProgress(1,'Starting analysis','Decoding the two required stems.'); setGate('wait','Analyzing both stems…'); log('gate: starting compact feature pass…');
   try{
     const a=await analyzeSlot(lead,'lead',2,46); const b=await analyzeSlot(backing,'backing',48,46);
-    // The old .78 cutoff was paired with broken feature math and rejected
-    // legitimate stems. Keep admission conservative, but do not fail good
-    // vocal recordings merely because their spectrum is not textbook-perfect.
-    const threshold=.60;
-    const leadOk=a>=threshold, backingOk=b>=threshold, ok=leadOk&&backingOk;
-    passed=ok;
-    $('leadCard').classList.toggle('good',leadOk); $('leadCard').classList.toggle('bad',!leadOk);
-    $('bgCard').classList.toggle('good',backingOk); $('bgCard').classList.toggle('bad',!backingOk);
-    if(ok){setProgress(100,'Analysis complete','Both stems passed the admission gate.'); setGate('ok',`Both stems passed the vocal-admission gate (${(a*100).toFixed(0)}% / ${(b*100).toFixed(0)}%). Generation unlocked.`); $('generate').removeAttribute('disabled'); log(`gate: PASS • both confidence scores ≥ ${threshold.toFixed(2)}`);}
-    else{setProgress(100,'Analysis complete','At least one required stem failed the admission gate.'); const failed=[leadOk?'':`lead ${(a*100).toFixed(0)}%`,backingOk?'':`backing ${(b*100).toFixed(0)}%`].filter(Boolean).join(', '); setGate('bad',`Rejected: ${failed}. Add a cleaner isolated vocal stem and analyze again.`); $('generate').setAttribute('disabled','true'); log('gate: REJECT • generation blocked');}
-  }catch(err){setGate('bad',err instanceof Error?err.message:'Analysis failed.'); log('gate: ERROR');}
+    const threshold=.60; const leadOk=a>=threshold, backingOk=b>=threshold, ok=leadOk&&backingOk; passed=ok;
+    $('leadCard').classList.toggle('good',leadOk); $('leadCard').classList.toggle('bad',!leadOk); $('bgCard').classList.toggle('good',backingOk); $('bgCard').classList.toggle('bad',!backingOk);
+    const v2Detected=(lead.stats?.secondaryVoice??0)>=.58; const bgDetected=(backing.stats?.vocalActivity??0)>=.48 && b>=threshold;
+    $('v2Status').textContent=v2Detected?'detected • '+Math.round((lead.stats?.secondaryVoice??0)*100)+'%':'not detected • '+Math.round((lead.stats?.secondaryVoice??0)*100)+'%';
+    $('bgStatus').textContent=bgDetected?'detected • '+Math.round((backing.stats?.vocalActivity??0)*100)+'%':'not detected • '+Math.round((backing.stats?.vocalActivity??0)*100)+'%';
+    log('v2 detection: '+(v2Detected?'SECOND VOICE DETECTED':'no second-voice signal')); log('bg detection: '+(bgDetected?'BACKGROUND VOCAL ACTIVITY DETECTED':'no background-vocal activity detected'));
+    if(ok){setProgress(100,'Analysis complete','Stem gate passed; V2/BG detection is ready for TTML assembly.');setGate('ok','Both stems passed ('+(a*100).toFixed(0)+'% / '+(b*100).toFixed(0)+'%). V2: '+(v2Detected?'detected':'not detected')+' • BG: '+(bgDetected?'detected':'not detected')+'.');$('generate').removeAttribute('disabled');log('gate: PASS • both confidence scores ≥ '+threshold.toFixed(2));}
+    else{setProgress(100,'Analysis complete','At least one required stem failed the admission gate.');const failed=[leadOk?'':'lead '+(a*100).toFixed(0)+'%',backingOk?'':'backing '+(b*100).toFixed(0)+'%'].filter(Boolean).join(', ');setGate('bad','Rejected: '+failed+'. Add a cleaner isolated vocal stem and analyze again.');$('generate').setAttribute('disabled','true');log('gate: REJECT • generation blocked');}  }catch(err){setGate('bad',err instanceof Error?err.message:'Analysis failed.'); log('gate: ERROR');}
   $('analyze').removeAttribute('disabled');
 });
 
@@ -330,13 +302,15 @@ function sleep(ms:number){return new Promise<void>(r=>setTimeout(r,ms));}
 function toTime(ms:number){const s=ms/1000;const m=Math.floor(s/60);const sec=s-m*60;return `00:${String(m).padStart(2,'0')}:${sec.toFixed(3).padStart(6,'0')}`;}
 function makeTtml(){
   const title=escapeHtml(($('title') as HTMLInputElement).value||'Untitled Session'); const artist=escapeHtml(($('artist') as HTMLInputElement).value||'Unknown Artist'); const lang=($('lang') as HTMLSelectElement).value;
-  const lyrics=($('lyrics') as HTMLInputElement).value.trim(); const words=(lyrics?lyrics.split(/\s+/):['Generated','timing','will','be','inserted']).slice(0,48); const duration=Math.max(1,backing?.stats?.duration??lead?.stats?.duration??4); const step=(duration*1000)/words.length;
-  const spans=words.map((w,i)=>`        <span begin="${toTime(i*step)}" end="${toTime((i+1)*step)}">${escapeHtml(w)}</span>`).join(' ');
-  const bgOn=qs<HTMLButtonElement>('[data-toggle="bg"]').classList.contains('on'); const v2On=qs<HTMLButtonElement>('[data-toggle="v2"]').classList.contains('on'); const partsOn=qs<HTMLButtonElement>('[data-toggle="parts"]').classList.contains('on');
-  const bgStart=toTime(step*1.2); const bgEnd=toTime(Math.min(duration*1000,step*(words.length>2?2.5:2)));
-  const bg=v2On&&bgOn?`\n        <span ttm:role="x-bg" begin="${bgStart}" end="${bgEnd}" ttm:agent="v2">background</span>`:'';
+  const lyrics=($('lyrics') as HTMLInputElement).value.trim(); const words=(lyrics?lyrics.split(/\s+/):['Generated','timing','will','be','inserted']).slice(0,48);
+  const duration=Math.max(1,backing?.stats?.duration??lead?.stats?.duration??4); const durationMs=duration*1000; const units=buildSyllableTimeline(words,durationMs,lang);
+  const v2On=qs<HTMLButtonElement>('[data-toggle="v2"]').classList.contains('on'); const bgOn=qs<HTMLButtonElement>('[data-toggle="bg"]').classList.contains('on'); const partsOn=qs<HTMLButtonElement>('[data-toggle="parts"]').classList.contains('on');
+  const v2Detected=(lead?.stats?.secondaryVoice??0)>=.58; const bgDetected=(backing?.stats?.vocalActivity??0)>=.48 && (backing?.score??0)>=.60; const v2Enabled=v2On&&v2Detected; const bgEnabled=bgOn&&bgDetected;
+  const spans=renderSyllables(units,v2Enabled,lead?.stats?.secondaryIntervals??[]);
+  let bg='';
+  if(bgEnabled){const bgUnits=units.filter(u=>unitOverlaps(u,backing?.stats?.vocalIntervals??[]));if(bgUnits.length){const bgStart=Math.min(...bgUnits.map(x=>x.begin));const bgEnd=Math.max(...bgUnits.map(x=>x.end));bg='\n        <span ttm:role="x-bg" begin="'+toTime(bgStart)+'" end="'+toTime(bgEnd)+'">'+renderSyllables(bgUnits,false,[]).trim()+'</span>';}}
   const part=partsOn?'\n    <div itunes:song-part="Verse">':'\n    <div>'; const closePart='\n    </div>';
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata" xmlns:itunes="http://music.apple.com/lyric-ttml-internal" xml:lang="${lang}" itunes:timing="Word">\n  <head>\n    <metadata>\n      <ttm:title>${title}</ttm:title>\n      <ttm:agent type="person" xml:id="v1"><ttm:name type="full">${artist}</ttm:name></ttm:agent>${v2On?'\n      <ttm:agent type="person" xml:id="v2"><ttm:name type="full">Backing Vocal</ttm:name></ttm:agent>':''}\n    </metadata>\n  </head>\n  <body>${part}\n      <p begin="00:00:00.000" end="${toTime(duration*1000)}" ttm:agent="v1">\n${spans}${bg}\n      </p>${closePart}\n  </body>\n</tt>`;
+  return '<?xml version="1.0" encoding="UTF-8"?>\n<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata" xmlns:itunes="http://music.apple.com/lyric-ttml-internal" xml:lang="'+lang+'" itunes:timing="Word">\n  <head>\n    <metadata>\n      <ttm:title>'+title+'</ttm:title>\n      <ttm:agent type="person" xml:id="v1"><ttm:name type="full">'+artist+'</ttm:name></ttm:agent>'+(v2Enabled?'\n      <ttm:agent type="person" xml:id="v2"><ttm:name type="full">Secondary Voice</ttm:name></ttm:agent>':'')+'\n    </metadata>\n  </head>\n  <body>'+part+'\n      <p begin="00:00:00.000" end="'+toTime(durationMs)+'" ttm:agent="v1">\n'+spans+bg+'\n      </p>'+closePart+'\n  </body>\n</tt>';
 }
 $('generate').addEventListener('click',async()=>{if(!passed)return; if(!settings.cpu){setGate('bad','CPU analysis is disabled for the current DSP implementation.');return;} $('generate').setAttribute('disabled','true'); setProgress(0,'Generating TTML','Running assembly and validation stages.'); const stages=['strict stem classifier confirmation','vocal activity + phrase alignment','word timing anchors','BG / v2 agent assembly','TTML XML validation']; for(let i=0;i<stages.length;i++){log(`run: ${stages[i]}…`); setProgress(Math.round((i/stages.length)*100),stages[i],`Stage ${i+1} of ${stages.length}`); await sleep($('eco').classList.contains('on')?150:260);} output=makeTtml(); $('xml').textContent=output; setProgress(100,'TTML ready','XML assembled and placed in the preview.'); const base=(($('title') as HTMLInputElement).value||'session').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'session'; $('fileName').textContent=base+'.ttml'; $('download').removeAttribute('disabled'); $('generate').removeAttribute('disabled'); log('complete: TTML ready'); $('result').scrollIntoView({behavior:'smooth'});});
 $('copy').addEventListener('click',async()=>{if(!output)return;try{await navigator.clipboard.writeText(output);$('copy').textContent='Copied';}catch{log('copy: clipboard permission unavailable');}});
