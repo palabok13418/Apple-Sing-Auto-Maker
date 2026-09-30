@@ -282,7 +282,7 @@ $('analyze').addEventListener('click', async () => {
             setGate('bad', `Rejected: ${failed}. Add a cleaner isolated vocal stem and analyze again.`);
             $('generate').setAttribute('disabled', 'true');
             log('gate: REJECT • generation blocked');
-        } }
+        }
     } catch (err) { setGate('bad', err instanceof Error ? err.message : 'Analysis failed.'); log('gate: ERROR'); }
     $('analyze').removeAttribute('disabled');
 });
