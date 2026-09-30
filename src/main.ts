@@ -455,7 +455,7 @@ function makeTtml(onProgress:(value:number,label:string,detail:string)=>void=()=
   return '<?xml version="1.0" encoding="UTF-8"?>\n<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata" xmlns:itunes="http://music.apple.com/lyric-ttml-internal" xml:lang="'+lang+'" itunes:timing="Word">\n  <head>\n    <metadata>\n      <ttm:title>'+title+'</ttm:title>\n      <ttm:agent type="person" xml:id="v1"><ttm:name type="full">'+artist+'</ttm:name></ttm:agent>'+(autoV2?'\n      <ttm:agent type="person" xml:id="v2"><ttm:name type="full">Secondary Voice</ttm:name></ttm:agent>':'')+'\n    </metadata>\n  </head>\n  <body>\n    <div itunes:song-part="Verse">\n'+outputLines+'\n    </div>\n  </body>\n</tt>';
 }
 function parseTtmlTime(value:string|null):number{
-  if(!value||!/^(?:\\d+):[0-5]\\d:[0-5]\\d\\.\\d{3}$/.test(value))return NaN;
+  if(!value||!/^(?:\d+):[0-5]\d:[0-5]\d\.\d{3}$/.test(value))return NaN;
   const parts=value.split(':');
   return (Number(parts[0])*3600+Number(parts[1])*60+Number(parts[2]))*1000;
 }
