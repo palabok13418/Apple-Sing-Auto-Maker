@@ -57,7 +57,7 @@ function fftLike(samples:Float32Array,sampleRate:number,maxFft=2048):Pick<AudioS
   const candidates:Array<{freq:number;score:number}>=[]; let harmonicity=0;
   const minLag=Math.max(2,Math.floor(sampleRate/500)); const maxLag=Math.min(Math.floor(sampleRate/70),Math.floor(n/2));
   if(rms>1e-4&&maxLag>minLag){
-    for(let lag=minLag;lag<=maxLag;lag+=4){
+    for(let lag=minLag;lag<=maxLag;lag+=2){
       let corr=0,ea=0,eb=0;
       for(let i=0;i<n-lag;i++){const a=samples[i]??0;const b=samples[i+lag]??0;corr+=a*b;ea+=a*a;eb+=b*b;}
       const normalized=Math.max(0,corr/Math.sqrt((ea+1e-12)*(eb+1e-12)));
@@ -70,7 +70,7 @@ function fftLike(samples:Float32Array,sampleRate:number,maxFft=2048):Pick<AudioS
   if(primary){
     for(const candidate of candidates.slice(1)){
       const ratio=candidate.freq/primary.freq; const absSemi=Math.abs(12*Math.log2(Math.max(1e-6,ratio)));
-      const harmonicRatio=Math.abs(ratio-2)<.08||Math.abs(ratio-3)<.10||Math.abs(ratio-4)<.12||Math.abs(ratio-.5)<.03||Math.abs(ratio-1/3)<.03||Math.abs(ratio-.25)<.025||Math.abs(ratio-1.5)<.05||Math.abs(ratio-4/3)<.05;
+      const harmonicRatio=Math.abs(ratio-2)<.08||Math.abs(ratio-3)<.10||Math.abs(ratio-4)<.12||Math.abs(ratio-.5)<.03||Math.abs(ratio-1/3)<.03||Math.abs(ratio-.25)<.025;
       if(absSemi>=2.5&&!harmonicRatio&&candidate.score>=primary.score*.68){secondary=candidate;break;}
     }
   }
