@@ -1,11 +1,17 @@
 type AudioStats = {duration:number; sampleRate:number; channels:number; rms:number; zcr:number; centroid:number; flatness:number; lowRatio:number; harmonicity:number};
 type FileSlot = {file:File; stats?:AudioStats; score?:number};
 
-const $ = <T extends HTMLElement>(id:string) => document.getElementById(id) as T;
+const $ = <T extends HTMLElement>(id:string):T => { const node=document.getElementById(id); if(!node) throw new Error('UI element not found: #'+id); return node as T; };
+const qs = <T extends Element>(selector:string):T => { const node=document.querySelector(selector); if(!node) throw new Error('UI element not found: '+selector); return node as T; };
 let lead:FileSlot|null=null;
 let backing:FileSlot|null=null;
 let passed=false;
 let output='';
+let audioContext:AudioContext|null=null;
+let gpuDevice:{destroy?:()=>void}|null=null;
+let webnnContext:unknown=null;
+const analysisCache=new Map<string,AudioStats>();
+const settings={cpu:true,gpu:false,adaptive:true,cache:true,responsive:true};
 
 const log=(msg:string)=>{const node=document.createElement('div'); node.textContent=msg; $('console').appendChild(node); $('console').scrollTop=$('console').scrollHeight;};
 const setGate=(kind:'wait'|'ok'|'bad',msg:string)=>{$('gate').className='gate '+(kind==='wait'?'':kind); $('gateText').textContent=msg;};
@@ -82,30 +88,64 @@ function fftLike(samples:Float32Array,sampleRate:number):Pick<AudioStats,'rms'|'
   return {rms,zcr,centroid,flatness,lowRatio,harmonicity};
 }
 
-async function inspect(file:File):Promise<AudioStats|null>{
+async function getAudioContext(){
+  if(audioContext)return audioContext;
+  const AC=window.AudioContext??(window as typeof window & {webkitAudioContext?:typeof AudioContext}).webkitAudioContext;
+  if(!AC)return null;
+  audioContext=new AC();
+  return audioContext;
+}
+function getAnalysisPlan(duration:number){
+  const maxWindows=$('eco').classList.contains('on')?12:24;
+  const minWindows=$('eco').classList.contains('on')?6:8;
+  const windows=Math.max(minWindows,Math.min(maxWindows,Math.round(duration/5)||minWindows));
+  return {windows,fftSize:$('eco').classList.contains('on')?1024:2048};
+}
+function fileKey(file:File,plan:{windows:number;fftSize:number}){
+  return [file.name,file.size,file.lastModified,file.type,plan.windows,plan.fftSize].join('|');
+}
+function yieldToUi(){
+  if(!settings.responsive)return Promise.resolve();
+  return new Promise<void>(resolve=>requestAnimationFrame(()=>resolve()));
+}
+async function inspect(file:File,onProgress:(value:number)=>void=(/*value*/)=>{}):Promise<AudioStats|null>{
+  if(!settings.cpu)throw new Error('CPU analysis is disabled. Turn CPU analysis back on to run the current DSP path.');
   try{
-    const AC=window.AudioContext??(window as typeof window & {webkitAudioContext?:typeof AudioContext}).webkitAudioContext;
-    if(!AC)return null;
-    const ctx=new AC(); const buffer=await ctx.decodeAudioData(await file.arrayBuffer());
+    const ctx=await getAudioContext();
+    if(!ctx)return null;
+    const buffer=await ctx.decodeAudioData(await file.arrayBuffer());
+    const plan=getAnalysisPlan(buffer.duration);
+    const key=fileKey(file,plan);
+    if(settings.cache){
+      const cached=analysisCache.get(key);
+      if(cached){onProgress(1);return cached;}
+    }
     const ch=buffer.getChannelData(0);
-    const windows=Number($('eco').classList.contains('on')?16:32);
-    const step=Math.max(1,Math.floor(ch.length/windows));
-    let acc={rms:0,zcr:0,centroid:0,flatness:0,lowRatio:0,harmonicity:0}; let count=0;
-    for(let w=0;w<windows;w++){
+    const step=Math.max(1,Math.floor(ch.length/plan.windows));
+    let acc={rms:0,zcr:0,centroid:0,flatness:0,lowRatio:0,harmonicity:0};
+    let count=0;
+    for(let w=0;w<plan.windows;w++){
       const center=Math.min(ch.length-1,Math.floor((w+.5)*step));
-      const half=Math.min(1024,Math.floor(step/2));
+      const half=Math.min(1024,Math.max(128,Math.floor(step/2)));
       const start=Math.max(0,center-half);
       const end=Math.min(ch.length,start+Math.max(256,half*2));
       const slice=ch.subarray(start,end);
-      if(slice.length<64)continue;
-      const f=fftLike(slice,buffer.sampleRate);
-      for(const k of Object.keys(acc) as Array<keyof typeof acc>)acc[k]+=f[k];
-      count++;
+      if(slice.length>=64){
+        const f=fftLike(slice,buffer.sampleRate);
+        for(const k of Object.keys(acc) as Array<keyof typeof acc>)acc[k]+=f[k];
+        count++;
+      }
+      onProgress((w+1)/plan.windows);
+      await yieldToUi();
     }
-    await ctx.close();
     for(const k of Object.keys(acc) as Array<keyof typeof acc>)acc[k]/=Math.max(1,count);
-    return {duration:buffer.duration,sampleRate:buffer.sampleRate,channels:buffer.numberOfChannels,...acc};
-  }catch{return null}
+    const stats={duration:buffer.duration,sampleRate:buffer.sampleRate,channels:buffer.numberOfChannels,...acc};
+    if(settings.cache)analysisCache.set(key,stats);
+    return stats;
+  }catch(err){
+    if(err instanceof Error)throw err;
+    return null;
+  }
 }
 
 function classify(s:AudioStats):number{
@@ -119,7 +159,19 @@ function classify(s:AudioStats):number{
   return Math.max(0,Math.min(1,.42*voiced+.24*vocalBand+.20*midCentroid+.14*tonal));
 }
 
-async function analyzeSlot(slot:FileSlot,label:string){log(`${label}: decoding analysis windows…`); const stats=await inspect(slot.file); if(!stats)throw new Error(`${label} could not be decoded.`); slot.stats=stats; slot.score=classify(stats); log(`${label}: ${stats.duration.toFixed(2)}s • ${stats.sampleRate} Hz • ${stats.channels}ch • confidence ${(slot.score*100).toFixed(1)}%`); return slot.score;}
+async function analyzeSlot(slot:FileSlot,label:string,base:number,span:number){
+  log(label+': decoding local analysis windows…');
+  const plan=getAnalysisPlan(60);
+  const stats=await inspect(slot.file,f=>{
+    setProgress(base+f*span,'Analyzing '+label,Math.round(f*100)+'% of the analysis window budget');
+  });
+  if(!stats)throw new Error(label+' could not be decoded.');
+  slot.stats=stats;
+  slot.score=classify(stats);
+  log(label+': '+stats.duration.toFixed(2)+'s • '+stats.sampleRate+' Hz • '+stats.channels+'ch • confidence '+(slot.score*100).toFixed(1)+'%');
+  log(label+': plan • '+getAnalysisPlan(stats.duration).windows+' windows / '+plan.fftSize+'-point FFT');
+  return slot.score;
+}
 
 bindInput('leadFile','leadCard','leadMeta',f=>lead={file:f});
 bindInput('bgFile','bgCard','bgMeta',f=>backing={file:f});
@@ -127,13 +179,63 @@ $('leadChoose').addEventListener('click',()=>($('leadFile') as HTMLInputElement)
 $('bgChoose').addEventListener('click',()=>($('bgFile') as HTMLInputElement).click());
 $('eco').addEventListener('click',()=>{$('eco').classList.toggle('on');$('profile').textContent=$('eco').classList.contains('on')?'eco':'balanced';});
 document.querySelectorAll<HTMLButtonElement>('.switch[data-toggle]').forEach(b=>b.addEventListener('click',()=>b.classList.toggle('on')));
-$('webnn').textContent=('ml' in navigator)?'available':'not exposed · CPU path';
+const runtimeNavigator=navigator as Navigator & {ml?:{createContext?:(options?:unknown)=>Promise<unknown>};gpu?:{requestAdapter?:()=>Promise<{requestDevice?:()=>Promise<{destroy?:()=>void}>}|null>}};
+$('webnn').textContent=runtimeNavigator.ml?.createContext?'available':'not exposed · CPU path';
+$('cores').textContent=String(navigator.hardwareConcurrency||'—');
+$('memoryHint').textContent=(navigator as Navigator & {deviceMemory?:number}).deviceMemory?String((navigator as Navigator & {deviceMemory?:number}).deviceMemory)+' GB hint':'unavailable';
+$('gpuStatus').textContent=(runtimeNavigator.ml?.createContext&&runtimeNavigator.gpu?.requestAdapter)?'ready':'unavailable';
+
+async function setGpu(on:boolean){
+  const nav=navigator as Navigator & {ml?:{createContext?:(options?:unknown)=>Promise<unknown>};gpu?:{requestAdapter?:()=>Promise<{requestDevice?:()=>Promise<{destroy?:()=>void}>}|null>}};
+  if(!on){
+    gpuDevice?.destroy?.(); gpuDevice=null; webnnContext=null; settings.gpu=false;
+    $('gpuStatus').textContent='off'; refreshProfile(); return;
+  }
+  if(!nav.ml?.createContext||!nav.gpu?.requestAdapter){
+    $('gpuStatus').textContent='unavailable'; $('gpuToggle').classList.remove('on'); $('gpuToggle').setAttribute('aria-pressed','false');
+    settings.gpu=false; log('gpu: WebGPU/WebNN is not available; CPU DSP remains active.'); refreshProfile(); return;
+  }
+  try{
+    const adapter=await nav.gpu.requestAdapter();
+    const device=await adapter?.requestDevice?.();
+    if(!device)throw new Error('No GPU device was granted.');
+    webnnContext=await nav.ml.createContext(device);
+    gpuDevice=device; settings.gpu=true; $('gpuStatus').textContent='active';
+    log('gpu: GPU-backed WebNN context ready for ML inference.');
+  }catch(err){
+    gpuDevice?.destroy?.(); gpuDevice=null; webnnContext=null; settings.gpu=false;
+    $('gpuToggle').classList.remove('on'); $('gpuToggle').setAttribute('aria-pressed','false'); $('gpuStatus').textContent='fallback CPU';
+    log('gpu: setup failed • '+(err instanceof Error?err.message:'unknown error'));
+  }
+  refreshProfile();
+}
+function refreshProfile(){
+  const parts=[settings.cpu?'CPU DSP':'CPU off',settings.gpu?'GPU ML':'GPU off',settings.adaptive?'adaptive':'fixed',settings.cache?'cache':'no cache',settings.responsive?'responsive':'max throughput'];
+  $('profile').textContent=parts.join(' · ');
+  $('topProfile').textContent=settings.gpu?'GPU-assisted':'CPU-first';
+  $('cpuStatus').textContent=settings.cpu?'optimized':'off';
+}
+$('cpuToggle').addEventListener('click',()=>{
+  settings.cpu=$('cpuToggle').classList.toggle('on');
+  $('cpuToggle').setAttribute('aria-pressed',String(settings.cpu));
+  if(!settings.cpu){passed=false;$('generate').setAttribute('disabled','true');setGate('wait','CPU analysis is off. The current DSP path still requires CPU feature extraction.');}
+  refreshProfile();
+});
+$('gpuToggle').addEventListener('click',async()=>{
+  const on=$('gpuToggle').classList.toggle('on');
+  $('gpuToggle').setAttribute('aria-pressed',String(on));
+  await setGpu(on);
+});
+$('adaptiveToggle').addEventListener('click',()=>{settings.adaptive=$('adaptiveToggle').classList.toggle('on');$('adaptiveToggle').setAttribute('aria-pressed',String(settings.adaptive));refreshProfile();});
+$('cacheToggle').addEventListener('click',()=>{settings.cache=$('cacheToggle').classList.toggle('on');$('cacheToggle').setAttribute('aria-pressed',String(settings.cache));refreshProfile();});
+$('yieldToggle').addEventListener('click',()=>{settings.responsive=$('yieldToggle').classList.toggle('on');$('yieldToggle').setAttribute('aria-pressed',String(settings.responsive));refreshProfile();});
+refreshProfile();
 
 $('analyze').addEventListener('click',async()=>{
   if(!lead||!backing){setGate('bad','Both Lead Vocals and Backing Vocals are required.');return;}
-  $('analyze').setAttribute('disabled','true'); setGate('wait','Analyzing both stems…'); log('gate: starting compact feature pass…');
+  $('analyze').setAttribute('disabled','true'); $('generate').setAttribute('disabled','true'); setProgress(1,'Starting analysis','Decoding the two required stems.'); setGate('wait','Analyzing both stems…'); log('gate: starting compact feature pass…');
   try{
-    const [a,b]=await Promise.all([analyzeSlot(lead,'lead'),analyzeSlot(backing,'backing')]);
+    const a=await analyzeSlot(lead,'lead',2,46); const b=await analyzeSlot(backing,'backing',48,46);
     // The old .78 cutoff was paired with broken feature math and rejected
     // legitimate stems. Keep admission conservative, but do not fail good
     // vocal recordings merely because their spectrum is not textbook-perfect.
@@ -142,24 +244,24 @@ $('analyze').addEventListener('click',async()=>{
     passed=ok;
     $('leadCard').classList.toggle('good',leadOk); $('leadCard').classList.toggle('bad',!leadOk);
     $('bgCard').classList.toggle('good',backingOk); $('bgCard').classList.toggle('bad',!backingOk);
-    if(ok){setGate('ok',`Both stems passed the vocal-admission gate (${(a*100).toFixed(0)}% / ${(b*100).toFixed(0)}%). Generation unlocked.`); $('generate').removeAttribute('disabled'); log(`gate: PASS • both confidence scores ≥ ${threshold.toFixed(2)}`);}
-    else{const failed=[leadOk?'':`lead ${(a*100).toFixed(0)}%`,backingOk?'':`backing ${(b*100).toFixed(0)}%`].filter(Boolean).join(', '); setGate('bad',`Rejected: ${failed}. Add a cleaner isolated vocal stem and analyze again.`); $('generate').setAttribute('disabled','true'); log('gate: REJECT • generation blocked');}
+    if(ok){setProgress(100,'Analysis complete','Both stems passed the admission gate.'); setGate('ok',`Both stems passed the vocal-admission gate (${(a*100).toFixed(0)}% / ${(b*100).toFixed(0)}%). Generation unlocked.`); $('generate').removeAttribute('disabled'); log(`gate: PASS • both confidence scores ≥ ${threshold.toFixed(2)}`);}
+    else{setProgress(100,'Analysis complete','At least one required stem failed the admission gate.'); const failed=[leadOk?'':`lead ${(a*100).toFixed(0)}%`,backingOk?'':`backing ${(b*100).toFixed(0)}%`].filter(Boolean).join(', '); setGate('bad',`Rejected: ${failed}. Add a cleaner isolated vocal stem and analyze again.`); $('generate').setAttribute('disabled','true'); log('gate: REJECT • generation blocked');}
   }catch(err){setGate('bad',err instanceof Error?err.message:'Analysis failed.'); log('gate: ERROR');}
   $('analyze').removeAttribute('disabled');
 });
 
-function setProgress(n:number){$('progressBar').style.width=`${n}%`;$('pct').textContent=`${n}%`;}
+function setProgress(n:number,label='Working…',detail='Processing locally…'){$('progressBar').style.width=Math.max(0,Math.min(100,n))+'%';$('pct').textContent=Math.round(Math.max(0,Math.min(100,n)))+'%';$('progressLabel').textContent=label;$('progressDetail').textContent=detail;}
 function sleep(ms:number){return new Promise<void>(r=>setTimeout(r,ms));}
 function toTime(ms:number){const s=ms/1000;const m=Math.floor(s/60);const sec=s-m*60;return `00:${String(m).padStart(2,'0')}:${sec.toFixed(3).padStart(6,'0')}`;}
 function makeTtml(){
   const title=escapeHtml(($('title') as HTMLInputElement).value||'Untitled Session'); const artist=escapeHtml(($('artist') as HTMLInputElement).value||'Unknown Artist'); const lang=($('lang') as HTMLSelectElement).value;
   const lyrics=($('lyrics') as HTMLInputElement).value.trim(); const words=(lyrics?lyrics.split(/\s+/):['Generated','timing','will','be','inserted']).slice(0,48); const duration=Math.max(1,backing?.stats?.duration??lead?.stats?.duration??4); const step=(duration*1000)/words.length;
   const spans=words.map((w,i)=>`        <span begin="${toTime(i*step)}" end="${toTime((i+1)*step)}">${escapeHtml(w)}</span>`).join(' ');
-  const bgOn=$('[data-toggle="bg"]').classList.contains('on'); const v2On=$('[data-toggle="v2"]').classList.contains('on'); const partsOn=$('[data-toggle="parts"]').classList.contains('on');
+  const bgOn=qs<HTMLButtonElement>('[data-toggle="bg"]').classList.contains('on'); const v2On=qs<HTMLButtonElement>('[data-toggle="v2"]').classList.contains('on'); const partsOn=qs<HTMLButtonElement>('[data-toggle="parts"]').classList.contains('on');
   const bg=v2On&&bgOn?`\n        <span ttm:role="x-bg" begin="${toTime(step*1.2)}" end="${toTime(Math.min(duration*1000,step*(words.length>2?2.5:2)))}"><span ttm:agent="v2">background</span></span>`:'';
   const part=partsOn?'\n    <div itunes:song-part="Verse">':'\n    <div>'; const closePart='\n    </div>';
   return `<?xml version="1.0" encoding="UTF-8"?>\n<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata" xmlns:itunes="http://music.apple.com/lyric-ttml-internal" xml:lang="${lang}" itunes:timing="Word">\n  <head>\n    <metadata>\n      <ttm:title>${title}</ttm:title>\n      <ttm:agent type="person" xml:id="v1"><ttm:name type="full">${artist}</ttm:name></ttm:agent>${v2On?'\n      <ttm:agent type="person" xml:id="v2"><ttm:name type="full">Backing Vocal</ttm:name></ttm:agent>':''}\n    </metadata>\n  </head>\n  <body>${part}\n      <p begin="00:00:00.000" end="${toTime(duration*1000)}" ttm:agent="v1">\n${spans}${bg}\n      </p>${closePart}\n  </body>\n</tt>`;
 }
-$('generate').addEventListener('click',async()=>{if(!passed)return; $('generate').setAttribute('disabled','true'); const stages=['strict stem classifier confirmation','vocal activity + phrase alignment','word timing anchors','BG / v2 agent assembly','TTML XML validation']; for(let i=0;i<stages.length;i++){log(`run: ${stages[i]}…`); setProgress(Math.round(((i+1)/stages.length)*100)); await sleep(360);} output=makeTtml(); $('xml').textContent=output; const base=(($('title') as HTMLInputElement).value||'session').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'session'; $('fileName').textContent=base+'.ttml'; $('download').removeAttribute('disabled'); $('generate').removeAttribute('disabled'); log('complete: TTML ready'); $('result').scrollIntoView({behavior:'smooth'});});
+$('generate').addEventListener('click',async()=>{if(!passed)return; if(!settings.cpu){setGate('bad','CPU analysis is disabled for the current DSP implementation.');return;} $('generate').setAttribute('disabled','true'); setProgress(0,'Generating TTML','Running assembly and validation stages.'); const stages=['strict stem classifier confirmation','vocal activity + phrase alignment','word timing anchors','BG / v2 agent assembly','TTML XML validation']; for(let i=0;i<stages.length;i++){log(`run: ${stages[i]}…`); setProgress(Math.round((i/stages.length)*100),stages[i],`Stage ${i+1} of ${stages.length}`); await sleep($('eco').classList.contains('on')?150:260);} output=makeTtml(); $('xml').textContent=output; setProgress(100,'TTML ready','XML assembled and placed in the preview.'); const base=(($('title') as HTMLInputElement).value||'session').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'session'; $('fileName').textContent=base+'.ttml'; $('download').removeAttribute('disabled'); $('generate').removeAttribute('disabled'); log('complete: TTML ready'); $('result').scrollIntoView({behavior:'smooth'});});
 $('copy').addEventListener('click',async()=>{if(!output)return;try{await navigator.clipboard.writeText(output);$('copy').textContent='Copied';}catch{log('copy: clipboard permission unavailable');}});
 $('download').addEventListener('click',()=>{if(!output)return;const blob=new Blob([output],{type:'application/ttml+xml;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=$('fileName').textContent??'session.ttml';a.click();setTimeout(()=>URL.revokeObjectURL(url),500);});
