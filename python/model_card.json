@@ -2,10 +2,10 @@
   "model": "tiny-stem-purity-softmax",
   "deployment": "client",
   "target": "low-end CPU",
-  "training": "offline multinomial softmax with standardized audio features",
+  "training": "offline multinomial softmax with standardized audio features, class-balanced loss, early stopping, and deterministic holdout evaluation",
   "features": ["rms", "zcr", "centroid", "flatness", "low_ratio", "harmonicity", "vocal_activity", "vocal_coverage", "secondary_voice"],
   "classes": ["lead", "backing", "reject"],
   "policy": "reject ambiguous or mixed audio",
-  "reject_class_weight": 1.7,
-  "browser_gate": "compact calibrated feature ensemble; retrain the exported model with real labeled stems before production deployment"
+  "reject_class_weight": "inverse-frequency with 1.35x reject boost",
+  "browser_gate": "compact conservative ensemble with hard malformed-timestamp protection; export/train artifacts should be built from real labeled lead, backing, and reject stems before production threshold calibration"
 }
