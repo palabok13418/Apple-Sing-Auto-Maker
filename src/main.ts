@@ -14,8 +14,6 @@ let backing:FileSlot|null=null;
 let passed=false;
 let output='';
 let audioContext:AudioContext|null=null;
-let gpuAdapter:any=null;
-let gpuDevice:{destroy?:()=>void}|null=null;
 let webnnContext:unknown=null;
 let gpuComputeReady=false;
 let alignmentPipelinePromise:Promise<any>|null=null;
@@ -200,7 +198,7 @@ function alignmentLanguage(lang:string):string|undefined{
   const map:Record<string,string>={'en-US':'english',ja:'japanese',ko:'korean','zh-Hans':'chinese',fil:'tagalog'};
   return map[lang];
 }
-function configureAlignmentRuntime(mod:any,useGpu:boolean,adapter:any):void{
+function configureAlignmentRuntime(mod:any):void{
   try{
     const onnx=mod?.env?.backends?.onnx;
     // Keep expected ONNX Runtime placement chatter out of the browser console.
@@ -208,11 +206,9 @@ function configureAlignmentRuntime(mod:any,useGpu:boolean,adapter:any):void{
     if(onnx?.env){
       try{onnx.env.logLevel='error';}catch(e){}
     }
-    // Transformers.js 3.x/ORT may expose an adapter hook. Reuse the adapter
-    // already validated by the app so ORT does not need to probe Windows again.
-    if(useGpu&&adapter&&onnx?.webgpu){
-      try{onnx.webgpu.adapter=adapter;}catch(e){}
-    }
+    // Do not inject an app-owned GPUAdapter into ORT. The WebGPU availability
+    // probe deliberately does not consume an adapter; ONNX Runtime owns device
+    // creation for the actual Whisper WebGPU session.
   }catch(e){}
 }
 
@@ -227,7 +223,7 @@ async function getAlignmentPipeline():Promise<any>{
     const load=new Function('u','return import(u)') as (u:string)=>Promise<any>;
     const mod=await load('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm');
     const useGpu=settings.gpu&&gpuComputeReady;
-    configureAlignmentRuntime(mod,useGpu,gpuAdapter);
+    configureAlignmentRuntime(mod);
     return mod.pipeline('automatic-speech-recognition','onnx-community/whisper-tiny',{
       device:useGpu?'webgpu':'wasm',
       // Whisper Tiny publishes matching fp16 encoder/merged-decoder ONNX weights.
@@ -613,73 +609,51 @@ $('cores').textContent=String(navigator.hardwareConcurrency||'—');
 $('memoryHint').textContent=(navigator as Navigator & {deviceMemory?:number}).deviceMemory?String((navigator as Navigator & {deviceMemory?:number}).deviceMemory)+' GB hint':'unavailable';
 $('gpuStatus').textContent=runtimeNavigator.gpu?.requestAdapter?'ready':'unavailable';
 
-async function probeWebGpu():Promise<{device:any;adapter:any}|null>{
+async function probeWebGpu():Promise<{adapter:any}|null>{
   const nav=navigator as Navigator & {gpu?:any};
   if(!nav.gpu?.requestAdapter)return null;
+  // Availability check only. Do not call adapter.requestDevice() here because
+  // ONNX Runtime must own the adapter's device.
   const adapter=await nav.gpu.requestAdapter();
-  if(!adapter?.requestDevice)return null;
-  const device=await adapter.requestDevice();
-  if(!device)return null;
-
-  // Real compute probe: this confirms the device can execute a compute pass,
-  // rather than treating navigator.gpu presence as proof of working GPU use.
-  const shader=device.createShaderModule?.({code:`
-    @group(0) @binding(0) var<storage,read_write> data: array<f32>;
-    @compute @workgroup_size(1)
-    fn main() {
-      data[0] = data[0] * 2.0;
-    }
-  `});
-  if(shader&&device.createBuffer&&device.createBindGroupLayout&&device.createPipeline){
-    const buffer=device.createBuffer({size:16,usage:0x80|0x08});
-    const staging=device.createBuffer({size:16,usage:0x01|0x08});
-    const layout=device.createBindGroupLayout({entries:[{binding:0,visibility:4,buffer:{type:'storage'}}]});
-    const pipeline=device.createComputePipeline({layout:device.createPipelineLayout({bindGroupLayouts:[layout]}),compute:{module:shader,entryPoint:'main'}});
-    const bindGroup=device.createBindGroup({layout,entries:[{binding:0,resource:{buffer}}]});
-    const encoder=device.createCommandEncoder();
-    const pass=encoder.beginComputePass();
-    pass.setPipeline(pipeline); pass.setBindGroup(0,bindGroup); pass.dispatchWorkgroups(1); pass.end();
-    encoder.copyBufferToBuffer(buffer,0,staging,0,16);
-    device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone?.();
-    buffer.destroy?.(); staging.destroy?.();
-  }
-  return {device,adapter};
+  return adapter?{adapter}:null;
 }
 
 async function setGpu(on:boolean){
   const nav=navigator as Navigator & {ml?:any;gpu?:any};
   if(!on){
     resetAlignmentPipeline();
-    gpuDevice?.destroy?.(); gpuDevice=null; gpuAdapter=null; webnnContext=null; gpuComputeReady=false; settings.gpu=false;
+    webnnContext=null; gpuComputeReady=false; settings.gpu=false;
     $('gpuStatus').textContent='off'; refreshProfile(); return;
   }
 
   try{
     const gpu=await probeWebGpu();
     if(!gpu)throw new Error('WebGPU is not available or could not create a device.');
-    gpuAdapter=gpu.adapter;
-    gpuDevice=gpu.device;
     gpuComputeReady=true;
     resetAlignmentPipeline();
 
     if(nav.ml?.createContext){
       try{
-        webnnContext=await nav.ml.createContext(gpu.device);
-        log('gpu: WebGPU compute device ready; WebNN ML context also available.');
+        webnnContext=await nav.ml.createContext({powerPreference:'high-performance',accelerated:true});
+        log('gpu: WebGPU adapter available; ONNX Runtime will own the inference device; WebNN ML context also available.');
       }catch{
-        webnnContext=null;
-        log('gpu: WebGPU compute device ready; WebNN ML context unavailable, using GPU compute path.');
+        try{
+          webnnContext=await nav.ml.createContext();
+          log('gpu: WebGPU adapter available; ONNX Runtime owns the inference device; WebNN fallback context available.');
+        }catch{
+          webnnContext=null;
+          log('gpu: WebGPU adapter available; ONNX Runtime owns the inference device; WebNN context unavailable.');
+        }
       }
     }else{
       webnnContext=null;
-      log('gpu: WebGPU compute device ready; WebNN is not exposed in this browser.');
+      log('gpu: WebGPU adapter available; ONNX Runtime owns the inference device; WebNN is not exposed in this browser.');
     }
 
     settings.gpu=true;
     $('gpuStatus').textContent='active';
   }catch(err){
-    gpuDevice?.destroy?.(); gpuDevice=null; webnnContext=null; gpuComputeReady=false; settings.gpu=false;
+    webnnContext=null; gpuComputeReady=false; settings.gpu=false;
     $('gpuToggle').classList.remove('on'); $('gpuToggle').setAttribute('aria-pressed','false'); $('gpuStatus').textContent='unavailable';
     log('gpu: '+(err instanceof Error?err.message:'unknown GPU setup error')+'; CPU remains active.');
   }
