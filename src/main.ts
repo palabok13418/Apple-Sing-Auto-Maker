@@ -209,14 +209,14 @@ $('leadChoose').addEventListener('click',()=>($('leadFile') as HTMLInputElement)
 $('bgChoose').addEventListener('click',()=>($('bgFile') as HTMLInputElement).click());
 $('eco').addEventListener('click',()=>{$('eco').classList.toggle('on');$('profile').textContent=$('eco').classList.contains('on')?'eco':'balanced';});
 document.querySelectorAll<HTMLButtonElement>('.switch[data-toggle]').forEach(b=>b.addEventListener('click',()=>b.classList.toggle('on')));
-const runtimeNavigator=navigator as Navigator & {ml?:{createContext?:(options?:unknown)=>Promise<unknown>};gpu?:{requestAdapter?:()=>Promise<{requestDevice?:()=>Promise<{destroy?:()=>void}>}|null>}};
+const runtimeNavigator=navigator as Navigator & {ml?:any;gpu?:any};
 $('webnn').textContent=runtimeNavigator.ml?.createContext?'available':'not exposed · CPU path';
 $('cores').textContent=String(navigator.hardwareConcurrency||'—');
 $('memoryHint').textContent=(navigator as Navigator & {deviceMemory?:number}).deviceMemory?String((navigator as Navigator & {deviceMemory?:number}).deviceMemory)+' GB hint':'unavailable';
 $('gpuStatus').textContent=(runtimeNavigator.ml?.createContext&&runtimeNavigator.gpu?.requestAdapter)?'ready':'unavailable';
 
 async function setGpu(on:boolean){
-  const nav=navigator as Navigator & {ml?:{createContext?:(options?:unknown)=>Promise<unknown>};gpu?:{requestAdapter?:()=>Promise<{requestDevice?:()=>Promise<{destroy?:()=>void}>}|null>}};
+  const nav=navigator as Navigator & {ml?:any;gpu?:any};
   if(!on){
     gpuDevice?.destroy?.(); gpuDevice=null; webnnContext=null; settings.gpu=false;
     $('gpuStatus').textContent='off'; refreshProfile(); return;
