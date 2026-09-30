@@ -197,22 +197,29 @@ def main() -> None:
 
     dataset = load_csv(args.dataset)
     train_rows, validation_rows = stratified_split(dataset, args.validation_fraction, args.seed)
+
+    # Diagnostic model is fitted only on the training split so validation
+    # accuracy is a real out-of-sample measurement.
+    diagnostic_model = train(train_rows)
+    train_acc = accuracy(diagnostic_model, train_rows)
+    validation_acc = accuracy(diagnostic_model, validation_rows) if validation_rows else None
+
+    # Export the final model fitted on every labeled row after the holdout
+    # measurement has been collected.
     model = train(dataset)
-    train_acc = accuracy(model, train_rows)
-    validation_acc = accuracy(model, validation_rows) if validation_rows else None
     model["evaluation"] = {
         "rows": len(dataset),
         "train_rows": len(train_rows),
         "validation_rows": len(validation_rows),
         "validation_fraction": args.validation_fraction,
         "seed": args.seed,
-        "train_accuracy": round(train_acc, 6),
-        "validation_accuracy": None if validation_acc is None else round(validation_acc, 6),
-        "note": "Accuracy is only a diagnostic; real production gating still requires stem-level test data and threshold calibration.",
+        "diagnostic_train_accuracy": round(train_acc, 6),
+        "diagnostic_validation_accuracy": None if validation_acc is None else round(validation_acc, 6),
+        "note": "Validation is a diagnostic only; production gating still requires independent stem-level test data and threshold calibration.",
     }
     args.output.write_text(json.dumps(model, indent=2) + "\n", encoding="utf-8")
     shown = "n/a" if validation_acc is None else f"{validation_acc:.3f}"
-    print(f"trained {len(dataset)} rows -> {args.output} (train_accuracy={train_acc:.3f}, validation_accuracy={shown})")
+    print(f"trained {len(dataset)} rows -> {args.output} (diagnostic_train_accuracy={train_acc:.3f}, diagnostic_validation_accuracy={shown})")
 
 
 if __name__ == "__main__":
