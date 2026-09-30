@@ -688,7 +688,7 @@ $('analyze').addEventListener('click',async()=>{
     const v2Detected=(lead.stats?.secondaryVoicePeak??0)>=.62&&lead.stats?.secondaryIntervals.length>0;
     const bgDetected=(backing.stats?.vocalCoverage??0)>=.045&&(backing.stats?.vocalActivity??0)>=.44&&backing.stats?.vocalIntervals.length>0&&backing.stats?.syllablePeaks.length>=2&&b>=threshold;
     $('v2Status').textContent=v2Detected?'detected • '+Math.round((lead.stats?.secondaryVoice??0)*100)+'%':'not detected • '+Math.round((lead.stats?.secondaryVoice??0)*100)+'%';
-    $('bgStatus').textContent=bgDetected?'detected • '+backing.stats.vocalIntervals.length+' vocal regions':'not detected • '+backing.stats.vocalIntervals.length+' vocal regions';
+    $('bgStatus').textContent=bgDetected?'detected • '+backingStats.vocalIntervals.length+' vocal regions':'not detected • '+backingStats.vocalIntervals.length+' vocal regions';
     log('v2 detection: '+(v2Detected?'SECOND VOICE DETECTED':'no second-voice signal')); log('bg detection: '+(bgDetected?'BACKGROUND VOCAL ACTIVITY DETECTED':'no background-vocal activity detected'));
     if(ok){setProgress(100,'Analysis complete','Stem gate passed; V2/BG detection is ready for TTML assembly.');setGate('ok','Both stems passed ('+(a*100).toFixed(0)+'% / '+(b*100).toFixed(0)+'%). V2: '+(v2Detected?'detected':'not detected')+' • BG: '+(bgDetected?'detected':'not detected')+'.');$('generate').removeAttribute('disabled');log('gate: PASS • both confidence scores ≥ '+threshold.toFixed(2));}
     else{setProgress(100,'Analysis complete','At least one required stem failed the admission gate.');const failed=[leadOk?'':'lead '+(a*100).toFixed(0)+'%',backingOk?'':'backing '+(b*100).toFixed(0)+'%'].filter(Boolean).join(', ');setGate('bad','Rejected: '+failed+'. Add a cleaner isolated vocal stem and analyze again.');$('generate').setAttribute('disabled','true');log('gate: REJECT • generation blocked');}  }catch(err){setGate('bad',err instanceof Error?err.message:'Analysis failed.'); log('gate: ERROR');}
@@ -751,30 +751,37 @@ async function makeTtml(onProgress:(value:number,label:string,detail:string)=>vo
   const lang=($('lang') as HTMLSelectElement).value;
   const lines=getLyricLines();
   if(!lines.length)throw new Error('Enter at least one lyric line before generating.');
-  if(!lead?.stats||!backing?.stats)throw new Error('Analyze both stems before generating.');
+  const leadSlot=lead;
+  const backingSlot=backing;
+  const leadStats=leadSlot?.stats;
+  const backingStats=backingSlot?.stats;
+  if(!leadSlot||!backingSlot||!leadStats||!backingStats)throw new Error('Analyze both stems before generating.');
 
-  const durationMs=Math.max(1000,Math.max(lead.stats.duration,backing.stats.duration)*1000);
-  const secondaryIntervals=normalizeIntervals(lead.stats.secondaryIntervals,durationMs/1000,.10);
+  const durationMs=Math.max(1000,Math.max(leadStats.duration,backingStats.duration)*1000);
+  const secondaryIntervals=normalizeIntervals(leadStats.secondaryIntervals,durationMs/1000,.10);
   const secondaryCoverage=secondaryIntervals.reduce((n,x)=>n+Math.max(0,x.end-x.start),0);
-  const v2Detected=(lead.stats.secondaryVoicePeak??0)>=.62&&secondaryIntervals.length>0&&secondaryCoverage>=.08;
-  const bgDetected=(backing.stats.vocalCoverage??0)>=.045&&(backing.stats.vocalActivity??0)>=.44&&backing.stats.vocalIntervals.length>0&&backing.stats.syllablePeaks.length>=2&&(backing.score??0)>=.60;
+  const v2Detected=(leadStats.secondaryVoicePeak??0)>=.62&&secondaryIntervals.length>0&&secondaryCoverage>=.08;
+  const bgDetected=(backingStats.vocalCoverage??0)>=.045&&(backingStats.vocalActivity??0)>=.44&&backingStats.vocalIntervals.length>0&&backingStats.syllablePeaks.length>=2&&(backing.score??0)>=.60;
   const allowV2=qs<HTMLButtonElement>('[data-toggle="v2"]').classList.contains('on');
   const allowBg=qs<HTMLButtonElement>('[data-toggle="bg"]').classList.contains('on');
   const autoV2=v2Detected&&allowV2,autoBg=bgDetected&&allowBg;
 
   onProgress(2,'Starting real acoustic alignment','The lead stem is the timing source for the main lyrics.');
-  lastLeadAlignment=await runRealAlignment(lead.file,lines,lang,(value,label,detail)=>onProgress(value*.62,label,detail));
+  lastLeadAlignment=await runRealAlignment(leadSlot.file,lines,lang,(value,label,detail)=>onProgress(value*.62,label,detail));
   if(lastLeadAlignment.coverage<.90)log('alignment warning: lead lyric coverage is '+(lastLeadAlignment.coverage*100).toFixed(1)+'%');
 
   onProgress(63,'Aligning backing vocal audio','The backing stem is aligned independently so BG timestamps come from that file.');
-  lastBackingAlignment=await runRealAlignment(backing.file,lines,lang,(value,label,detail)=>onProgress(63+value*.23,label,detail));
+  lastBackingAlignment=await runRealAlignment(backingSlot.file,lines,lang,(value,label,detail)=>onProgress(63+value*.23,label,detail));
 
-  const leadUnits=alignmentToLyricUnits(lastLeadAlignment,lead.stats.syllablePeaks,lang);
+  const leadAlignment=lastLeadAlignment;
+  const backingAlignment=lastBackingAlignment;
+  if(!leadAlignment||!backingAlignment)throw new Error('Acoustic alignment did not return a complete lead/backing result.');
+  const leadUnits=alignmentToLyricUnits(leadAlignment,leadStats.syllablePeaks,lang);
   let partial=makeDocumentHead(title,artist,lang,autoV2);
   $('xml').textContent=partial+makeDocumentTail();
 
   for(let i=0;i<leadUnits.length;i++){
-    partial+=renderRealAlignedLine(leadUnits[i],i,lastBackingAlignment.lines[i]??null,backing.stats.syllablePeaks,secondaryIntervals,autoV2,autoBg)+'\n';
+    partial+=renderRealAlignedLine(leadUnits[i],i,backingAlignment.lines[i]??null,backingStats.syllablePeaks,secondaryIntervals,autoV2,autoBg)+'\n';
     $('xml').textContent=partial+makeDocumentTail();
     onProgress(86+(i+1)/leadUnits.length*11,'Writing aligned lyric line '+(i+1)+' / '+leadUnits.length,'Writing measured audio timings into TTML.');
     await yieldToUi();
