@@ -121,6 +121,31 @@ function normalizeIntervals(intervals:AudioInterval[],durationSeconds:number,gap
     .map(x=>({start:Math.max(0,x.start),end:Math.max(Math.max(0,x.start),Math.min(durationSeconds,x.end))}))
     .filter(x=>x.end-x.start>=.04);
 }
+function fastPitchConfidence(samples:Float32Array,sampleRate:number):number{
+  if(samples.length<32)return 0;
+  const factor=Math.max(1,Math.floor(sampleRate/4000));
+  const down:number[]=[];
+  for(let i=0;i<samples.length;i+=factor)down.push(samples[i]??0);
+  const sr=sampleRate/factor;
+  const minLag=Math.max(2,Math.floor(sr/500));
+  const maxLag=Math.min(Math.floor(sr/70),Math.floor(down.length/2));
+  if(maxLag<=minLag)return 0;
+  let best=0;
+  let energy=0;
+  for(const x of down)energy+=x*x;
+  if(energy<1e-7)return 0;
+  for(let lag=minLag;lag<=maxLag;lag++){
+    let corr=0,a=0,b=0;
+    for(let i=0;i<down.length-lag;i++){
+      const x=down[i]??0,y=down[i+lag]??0;
+      corr+=x*y;a+=x*x;b+=y*y;
+    }
+    const normalized=corr/Math.sqrt(Math.max(1e-12,a*b));
+    if(normalized>best)best=normalized;
+  }
+  return clamp01(best);
+}
+
 function extractVocalIntervals(samples:Float32Array,sampleRate:number):{intervals:AudioInterval[];coverage:number;peaks:AudioPeak[];scores:Float32Array}{
   // Frame-level audio analysis: energy, ZCR and local voicing shape are used to
   // create real phrase and syllable timing anchors.
@@ -146,13 +171,19 @@ function extractVocalIntervals(samples:Float32Array,sampleRate:number):{interval
   const q50=sorted[Math.floor((sorted.length-1)*.50)]??0;
   const threshold=Math.max(.003,q20*1.65,maxRms*.10);
   for(let f=0;f<frames;f++){
+    const start=f*frame;
+    const end=Math.min(samples.length,start+frame);
+    const frameSamples=samples.subarray(start,end);
+    const pitch=fastPitchConfidence(frameSamples,sampleRate);
     const normalized=rmsValues[f]/Math.max(maxRms,1e-6);
     const energyScore=clamp01((rmsValues[f]-threshold)/Math.max(.001,maxRms-threshold));
     const zcrScore=clamp01(1-zcrValues[f]/.42);
     const localFloor=rmsValues[f]>=Math.max(threshold,q50*.72);
-    scores[f]=clamp01(energyScore*.56+zcrScore*.16+(localFloor?.18:0)+normalized*.10);
+    // Actual vocal evidence combines energy, clean zero-crossing behavior and
+    // periodic/pitched structure. This is intentionally stricter for BG stems.
+    scores[f]=clamp01(energyScore*.40+zcrScore*.14+pitch*.36+(localFloor?.07:0)+normalized*.03);
   }
-  const active=scores.map((score,f)=>score>=.38&&rmsValues[f]>=threshold&&zcrValues[f]<.48);
+  const active=scores.map((score,f)=>score>=.48&&rmsValues[f]>=threshold&&zcrValues[f]<.48);
   for(let f=1;f<frames-1;f++){
     if(!active[f]&&active[f-1]&&active[f+1]&&scores[f]>=.25)active[f]=true;
     if(active[f]&&!active[f-1]&&!active[f+1]&&scores[f]<.58)active[f]=false;
@@ -509,7 +540,7 @@ $('analyze').addEventListener('click',async()=>{
     const v2Detected=(lead.stats?.secondaryVoicePeak??0)>=.62&&lead.stats?.secondaryIntervals.length>0;
     const bgDetected=(backing.stats?.vocalCoverage??0)>=.045&&(backing.stats?.vocalActivity??0)>=.44&&backing.stats?.vocalIntervals.length>0&&backing.stats?.syllablePeaks.length>=2&&b>=threshold;
     $('v2Status').textContent=v2Detected?'detected • '+Math.round((lead.stats?.secondaryVoice??0)*100)+'%':'not detected • '+Math.round((lead.stats?.secondaryVoice??0)*100)+'%';
-    $('bgStatus').textContent=bgDetected?'detected • '+Math.round((backing.stats?.vocalActivity??0)*100)+'%':'not detected • '+Math.round((backing.stats?.vocalActivity??0)*100)+'%';
+    $('bgStatus').textContent=bgDetected?'detected • '+backing.stats.vocalIntervals.length+' vocal regions':'not detected • '+backing.stats.vocalIntervals.length+' vocal regions';
     log('v2 detection: '+(v2Detected?'SECOND VOICE DETECTED':'no second-voice signal')); log('bg detection: '+(bgDetected?'BACKGROUND VOCAL ACTIVITY DETECTED':'no background-vocal activity detected'));
     if(ok){setProgress(100,'Analysis complete','Stem gate passed; V2/BG detection is ready for TTML assembly.');setGate('ok','Both stems passed ('+(a*100).toFixed(0)+'% / '+(b*100).toFixed(0)+'%). V2: '+(v2Detected?'detected':'not detected')+' • BG: '+(bgDetected?'detected':'not detected')+'.');$('generate').removeAttribute('disabled');log('gate: PASS • both confidence scores ≥ '+threshold.toFixed(2));}
     else{setProgress(100,'Analysis complete','At least one required stem failed the admission gate.');const failed=[leadOk?'':'lead '+(a*100).toFixed(0)+'%',backingOk?'':'backing '+(b*100).toFixed(0)+'%'].filter(Boolean).join(', ');setGate('bad','Rejected: '+failed+'. Add a cleaner isolated vocal stem and analyze again.');$('generate').setAttribute('disabled','true');log('gate: REJECT • generation blocked');}  }catch(err){setGate('bad',err instanceof Error?err.message:'Analysis failed.'); log('gate: ERROR');}
