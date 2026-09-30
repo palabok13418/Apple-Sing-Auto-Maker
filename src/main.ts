@@ -194,63 +194,61 @@ function resampleTo16k(samples:Float32Array,sourceRate:number):Float32Array{
   }
   return out;
 }
-function alignmentLanguage(lang:string):string|undefined{
-  const map:Record<string,string>={'en-US':'english',ja:'japanese',ko:'korean','zh-Hans':'chinese',fil:'tagalog'};
-  return map[lang];
-}
-function configureAlignmentRuntime(mod:any):void{
-  try{
-    const onnx=mod?.env?.backends?.onnx;
-    // Keep expected ONNX Runtime placement chatter out of the browser console.
-    // Inference errors remain visible through the normal error path.
-    if(onnx?.env){
-      try{onnx.env.logLevel='error';}catch(e){}
-    }
-    // Do not inject an app-owned GPUAdapter into ORT. The WebGPU availability
-    // probe deliberately does not consume an adapter; ONNX Runtime owns device
-    // creation for the actual Whisper WebGPU session.
-  }catch(e){}
-}
-
 function resetAlignmentPipeline():void{
-  // A pipeline is bound to its execution backend. Recreate it after a GPU toggle.
+  // Whisper inference is worker-owned now. Keep this hook for GPU toggle
+  // compatibility without creating a main-thread ONNX session.
   alignmentPipelinePromise=null;
 }
 
-async function getAlignmentPipeline():Promise<any>{
-  if(alignmentPipelinePromise)return alignmentPipelinePromise;
-  alignmentPipelinePromise=(async()=>{
-    const load=new Function('u','return import(u)') as (u:string)=>Promise<any>;
-    const mod=await load('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm');
-    const useGpu=settings.gpu&&gpuComputeReady;
-    configureAlignmentRuntime(mod);
-    return mod.pipeline('automatic-speech-recognition','onnx-community/whisper-tiny_timestamped',{
-      device:useGpu?'webgpu':'wasm',
-      // Whisper Tiny publishes matching fp16 encoder/merged-decoder ONNX weights.
-      dtype:useGpu?{encoder_model:'fp32',decoder_model_merged:'q4'}:'q8',
-      // ORT's node-placement warnings are not actionable for this workload.
-      // Severity 3 keeps actual errors while hiding warning-level placement logs.
-      session_options:{logSeverityLevel:3}
-    });
-  })();
-  return alignmentPipelinePromise;
+function runWorkerAlignment(waveform:Float32Array,language:string,useGpu:boolean,onProgress:(value:number,label:string,detail:string)=>void):Promise<any>{
+  return new Promise((resolve,reject)=>{
+    const worker=new Worker('./whisper-worker.js?v=20260930-real-align-9',{type:'module'});
+    let finished=false;
+    const cleanup=()=>{
+      if(finished)return;
+      finished=true;
+      worker.terminate();
+      worker.onmessage=null;
+      worker.onerror=null;
+    };
+    worker.onmessage=(event:MessageEvent)=>{
+      const data=event.data??{};
+      if(data.type==='progress'){
+        onProgress(Number(data.value)||0,data.message??'Recognizing vocal audio',data.detail??'Running Whisper in a background worker.');
+      }else if(data.type==='status'){
+        onProgress(6,'Preparing acoustic model',data.message??'Loading Whisper in a background worker.');
+      }else if(data.type==='fallback'){
+        log('alignment worker: '+String(data.message??'GPU fallback activated'));
+        onProgress(8,'Continuing acoustic alignment',String(data.message??'Using CPU/WASM fallback.'));
+      }else if(data.type==='done'){
+        cleanup();
+        resolve(data);
+      }else if(data.type==='error'){
+        const error=new Error(String(data.message??'Whisper worker failed.'));
+        if(data.stack)error.stack=data.stack;
+        cleanup();
+        reject(error);
+      }
+    };
+    worker.onerror=(event:ErrorEvent)=>{
+      cleanup();
+      reject(new Error(event.message||'Whisper worker crashed.'));
+    };
+    worker.postMessage({type:'align',audio:waveform.buffer,language,useGpu},[waveform.buffer]);
+  });
 }
+
 async function runRealAlignment(file:File,lines:string[],lang:string,onProgress:(value:number,label:string,detail:string)=>void):Promise<RealAlignment>{
-  const pipe=await getAlignmentPipeline();
   const ctx=await getAudioContext();if(!ctx)throw new Error('Web Audio is unavailable.');
   onProgress(8,'Preparing acoustic alignment','Decoding the actual inserted vocal stem.');
   const buffer=await ctx.decodeAudioData(await file.arrayBuffer());
   const waveform=resampleTo16k(buffer.getChannelData(0),buffer.sampleRate);
   const language=alignmentLanguage(lang);
-  onProgress(20,'Recognizing sung words','Running local word timestamps against the actual waveform.');
-  const result=await pipe(waveform,{
-    return_timestamps:'word',
-    chunk_length_s:29,
-    stride_length_s:5,
-    ...(language?{language,task:'transcribe'}:{task:'transcribe'})
-  });
-  onProgress(58,'Force-aligning supplied lyrics','Mapping your exact textbox words onto the observed vocal sequence.');
-  return alignLyricsToTranscript(lines,splitTimedTranscript(result?.chunks??[]));
+  const result=await runWorkerAlignment(waveform,language??'',settings.gpu&&gpuComputeReady,onProgress);
+  onProgress(95,'Force-aligning supplied lyrics','Mapping your exact textbox words onto the observed acoustic word sequence.');
+  const alignment=alignLyricsToTranscript(lines,splitTimedTranscript(result?.chunks??[]));
+  log('acoustic alignment: '+file.name+' • '+alignment.matchedWords+'/'+alignment.totalWords+' words • '+(alignment.coverage*100).toFixed(1)+'% • model '+(result?.device??'unknown'));
+  return alignment;
 }
 
 async function getAudioContext(){
