@@ -631,7 +631,7 @@ async function getAlignmentPipeline() {
     const mod = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm');
     const useGpu = settings.gpu;
     configureAlignmentRuntime(mod);
-    return mod.pipeline('automatic-speech-recognition', 'onnx-community/whisper-tiny', {
+    return mod.pipeline('automatic-speech-recognition', 'onnx-community/whisper-tiny_timestamped', {
       device: useGpu ? 'webgpu' : 'wasm',
       dtype: useGpu ? { encoder_model: 'fp32', decoder_model_merged: 'q4' } : 'q8',
       session_options: { logSeverityLevel: 3 }
