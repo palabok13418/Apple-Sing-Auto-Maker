@@ -635,13 +635,63 @@ async function getAlignmentPipeline() {
     configureAlignmentRuntime(mod, useGpu, gpuAdapter);
     return mod.pipeline('automatic-speech-recognition', 'onnx-community/whisper-tiny', {
       device: useGpu ? 'webgpu' : 'wasm',
-      dtype: useGpu ? 'fp16' : 'fp32',
+      dtype: useGpu ? { encoder_model: 'fp32', decoder_model_merged: 'q4' } : 'q8',
       session_options: { logSeverityLevel: 3 }
     });
   })();
   return alignmentPipelinePromise;
 }
-async function runRealAlignment(file, lines, lang, onProgress, minCoverage, requireEveryLine) {
+
+function normalizeTranscriptWord(text) {
+  return String(text || '').normalize('NFKD').toLowerCase().replace(/\p{M}/gu, '').replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
+async function transcribeLongAudio(pipe, waveform, language, onProgress) {
+  const SAMPLE_RATE = 16000;
+  const CHUNK_SECONDS = 27;
+  const OVERLAP_SECONDS = 3;
+  const STEP_SECONDS = CHUNK_SECONDS - OVERLAP_SECONDS;
+  const chunkSize = CHUNK_SECONDS * SAMPLE_RATE;
+  const stepSize = STEP_SECONDS * SAMPLE_RATE;
+  const totalChunks = Math.max(1, Math.ceil(Math.max(1, waveform.length - chunkSize) / stepSize) + 1);
+  const words = [];
+  for (let index = 0, offset = 0; offset < waveform.length; index++, offset += stepSize) {
+    const end = Math.min(waveform.length, offset + chunkSize);
+    const chunk = waveform.slice(offset, end);
+    try {
+      const result = await pipe(chunk, {
+        return_timestamps: 'word',
+        ...(language ? { language, task: 'transcribe' } : { task: 'transcribe' }),
+        force_full_sequences: false
+      });
+      const local = transcriptWords(result && result.chunks);
+      const chunkStart = offset / SAMPLE_RATE;
+      for (const word of local) {
+        const start = chunkStart + Math.max(0, word.start);
+        const endTime = chunkStart + Math.max(word.start, word.end);
+        if (endTime <= chunkStart + 0.05) continue;
+        if (start >= chunkStart + CHUNK_SECONDS - 0.08 && endTime >= chunkStart + CHUNK_SECONDS - 0.08) continue;
+        words.push({ ...word, start, end: endTime });
+      }
+    } catch (err) {
+      throw new Error('Whisper chunk ' + (index + 1) + '/' + totalChunks + ' failed at ' + (offset / SAMPLE_RATE).toFixed(2) + 's: ' + (err instanceof Error ? err.message : String(err)));
+    }
+    onProgress((index + 1) / totalChunks);
+    await yieldToUi();
+  }
+  words.sort((a, b) => a.start - b.start);
+  const deduped = [];
+  for (const word of words) {
+    const prev = deduped[deduped.length - 1];
+    if (prev && normalizeTranscriptWord(prev.text) === normalizeTranscriptWord(word.text) && Math.abs(prev.start - word.start) < 1.25) {
+      prev.start = Math.min(prev.start, word.start);
+      prev.end = Math.max(prev.end, word.end);
+    } else deduped.push(word);
+  }
+  return deduped;
+}
+
+async function runRealAlignmentasync function runRealAlignment(file, lines, lang, onProgress, minCoverage, requireEveryLine) {
   const pipe = await getAlignmentPipeline();
   const ctx = await getAudioContext();
   if (!ctx) throw new Error('Web Audio is unavailable.');
@@ -661,15 +711,10 @@ async function runRealAlignment(file, lines, lang, onProgress, minCoverage, requ
     return out;
   })();
   const language = alignmentLanguage(lang);
-  onProgress(20, 'Recognizing sung words', 'Running Whisper word timestamps against the real audio.');
-  const result = await pipe({ raw: waveform, sampling_rate: 16000 }, {
-    return_timestamps: 'word',
-    chunk_length_s: 30,
-    stride_length_s: 5,
-    ...(language ? { language, task: 'transcribe' } : { task: 'transcribe' })
-  });
-  onProgress(58, 'Force-aligning existing lyrics', 'Mapping the textbox words to the observed acoustic word sequence.');
-  const alignment = alignLyrics(lines, transcriptWords(result && result.chunks), minCoverage, requireEveryLine);
+  onProgress(20, 'Recognizing sung words', 'Running Whisper on the actual waveform in bounded acoustic windows.');
+  const observed = await transcribeLongAudio(pipe, waveform, language, value => onProgress(20 + value * 36, 'Recognizing sung words', 'Whisper acoustic chunks are being aligned.'));
+  onProgress(58, 'Force-aligning existing lyrics', 'Mapping the textbox words to the observed acoustic sequence.');
+  const alignment = alignLyrics(lines, observed, minCoverage, requireEveryLine);
   log('acoustic alignment: ' + file.name + ' • ' + alignment.matchedWords + '/' + alignment.totalWords + ' words • ' + (alignment.coverage * 100).toFixed(1) + '%');
   return alignment;
 }
@@ -889,8 +934,10 @@ $('generate').addEventListener('click', async () => {
     $('download').removeAttribute('disabled');
     $('result').scrollIntoView({ behavior: 'smooth' });
   } catch (err) {
-    setGate('bad', err instanceof Error ? err.message : 'TTML generation failed.');
-    log('generation: ERROR');
+    const message = err instanceof Error ? err.message : String(err);
+    setGate('bad', message);
+    log('generation: ERROR • ' + message);
+    if (err instanceof Error && err.stack) log('generation stack: ' + err.stack.split('\n').slice(0, 4).join(' | '));
   } finally {
     $('generate').removeAttribute('disabled');
   }
