@@ -606,41 +606,51 @@ function renderLine(line, index, backingLine, backingEvidence, secondaryInterval
   return '      <p begin="' + toTime(line.begin) + '" end="' + toTime(line.end) + '" itunes:key="L' + (index + 1) + '" ttm:agent="' + agent + '">\n        ' + main + bg + '\n      </p>';
 }
 
-function alignmentLanguage(lang) {
-  return ({ 'en-US': 'english', ja: 'japanese', ko: 'korean', 'zh-Hans': 'chinese', fil: 'tagalog' })[lang];
-}
-function configureAlignmentRuntime(mod) {
-  try {
-    const onnx = mod?.env?.backends?.onnx;
-    if (onnx?.env) {
-      try { onnx.env.logLevel = 'error'; } catch (e) {}
-    }
-    // Do not inject an app-owned GPUAdapter into ORT. The availability probe
-    // deliberately does not consume an adapter; ONNX Runtime owns device
-    // creation for the actual Whisper WebGPU session.
-  } catch (e) {}
-}
-
 function resetAlignmentPipeline() {
+  // Whisper inference is worker-owned now. Keep this hook for the GPU toggle
+  // without creating or destroying a main-thread ONNX session.
   alignmentPipelinePromise = null;
 }
 
-async function getAlignmentPipeline() {
-  if (alignmentPipelinePromise) return alignmentPipelinePromise;
-  alignmentPipelinePromise = (async () => {
-    const mod = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm');
-    const useGpu = settings.gpu;
-    configureAlignmentRuntime(mod);
-    return mod.pipeline('automatic-speech-recognition', 'onnx-community/whisper-tiny_timestamped', {
-      device: useGpu ? 'webgpu' : 'wasm',
-      dtype: useGpu ? { encoder_model: 'fp32', decoder_model_merged: 'q4' } : 'q8',
-      session_options: { logSeverityLevel: 3 }
-    });
-  })();
-  return alignmentPipelinePromise;
+function runWorkerAlignment(waveform, language, useGpu, onProgress) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker('./whisper-worker.js?v=20260930-real-align-9', { type: 'module' });
+    let finished = false;
+    const cleanup = () => {
+      if (finished) return;
+      finished = true;
+      worker.terminate();
+      worker.onmessage = null;
+      worker.onerror = null;
+    };
+    worker.onmessage = event => {
+      const data = event.data || {};
+      if (data.type === 'progress') {
+        onProgress(Number(data.value) || 0, data.message || 'Recognizing vocal audio', data.detail || 'Running Whisper in a background worker.');
+      } else if (data.type === 'status') {
+        onProgress(6, 'Preparing acoustic model', data.message || 'Loading Whisper in a background worker.');
+      } else if (data.type === 'fallback') {
+        log('alignment worker: ' + String(data.message || 'GPU fallback activated'));
+        onProgress(8, 'Continuing acoustic alignment', String(data.message || 'Using CPU/WASM fallback.'));
+      } else if (data.type === 'done') {
+        cleanup();
+        resolve(data);
+      } else if (data.type === 'error') {
+        const error = new Error(String(data.message || 'Whisper worker failed.'));
+        if (data.stack) error.stack = data.stack;
+        cleanup();
+        reject(error);
+      }
+    };
+    worker.onerror = event => {
+      cleanup();
+      reject(new Error(event.message || 'Whisper worker crashed.'));
+    };
+    worker.postMessage({ type: 'align', audio: waveform.buffer, language, useGpu }, [waveform.buffer]);
+  });
 }
+
 async function runRealAlignment(file, lines, lang, onProgress, minCoverage, requireEveryLine) {
-  const pipe = await getAlignmentPipeline();
   const ctx = await getAudioContext();
   if (!ctx) throw new Error('Web Audio is unavailable.');
   onProgress(8, 'Decoding ' + file.name, 'Using the actual inserted vocal waveform.');
@@ -659,16 +669,10 @@ async function runRealAlignment(file, lines, lang, onProgress, minCoverage, requ
     return out;
   })();
   const language = alignmentLanguage(lang);
-  onProgress(20, 'Recognizing sung words', 'Running Whisper word timestamps against the real audio.');
-  const result = await pipe(waveform, {
-    return_timestamps: 'word',
-    chunk_length_s: 29,
-    stride_length_s: 5,
-    ...(language ? { language, task: 'transcribe' } : { task: 'transcribe' })
-  });
-  onProgress(58, 'Force-aligning existing lyrics', 'Mapping the textbox words to the observed acoustic word sequence.');
-  const alignment = alignLyrics(lines, transcriptWords(result && result.chunks), minCoverage, requireEveryLine);
-  log('acoustic alignment: ' + file.name + ' • ' + alignment.matchedWords + '/' + alignment.totalWords + ' words • ' + (alignment.coverage * 100).toFixed(1) + '%');
+  const workerResult = await runWorkerAlignment(waveform, language || '', settings.gpu, onProgress);
+  onProgress(95, 'Force-aligning existing lyrics', 'Mapping the supplied lyric words to the observed acoustic word sequence.');
+  const alignment = alignLyrics(lines, transcriptWords(workerResult?.chunks), minCoverage, requireEveryLine);
+  log('acoustic alignment: ' + file.name + ' • ' + alignment.matchedWords + '/' + alignment.totalWords + ' words • ' + (alignment.coverage * 100).toFixed(1) + '% • model ' + (workerResult?.device || 'unknown'));
   return alignment;
 }
 
