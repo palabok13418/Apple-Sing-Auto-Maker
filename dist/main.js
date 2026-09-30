@@ -288,7 +288,7 @@ $('analyze').addEventListener('click', async () => {
 });
 function setProgress(n, label = 'Working…', detail = 'Processing locally…') { const v = Math.max(0, Math.min(100, n)); $('progressBar').style.width = v + '%'; $('pct').textContent = Math.round(v) + '%'; $('progressLabel').textContent = label; $('progressDetail').textContent = detail; }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function toTime(ms) { const s = ms / 1000; const m = Math.floor(s / 60); const sec = s - m * 60; return `00:${String(m).padStart(2, '0')}:${sec.toFixed(3).padStart(6, '0')}`; }
+function toTime(ms) { const safeMs = Math.max(0, Math.floor(Number.isFinite(ms) ? ms : 0)); const totalSeconds = Math.floor(safeMs / 1000); const hours = Math.floor(totalSeconds / 3600); const minutes = Math.floor((totalSeconds - hours * 3600) / 60); const seconds = totalSeconds - hours * 3600 - minutes * 60; const millis = safeMs % 1000; return String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0') + '.' + String(millis).padStart(3, '0'); }
 function makeTtml() {
     const title = escapeHtml($('title').value || 'Untitled Session'); const artist = escapeHtml($('artist').value || 'Unknown Artist'); const lang = $('lang').value;
     const lyrics = $('lyrics').value.trim(); const words = (lyrics ? lyrics.split(/\s+/) : ['Generated', 'timing', 'will', 'be', 'inserted']).slice(0, 48);
