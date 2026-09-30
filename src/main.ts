@@ -10,6 +10,7 @@ let output='';
 let audioContext:AudioContext|null=null;
 let gpuDevice:{destroy?:()=>void}|null=null;
 let webnnContext:unknown=null;
+let gpuComputeReady=false;
 const analysisCache=new Map<string,AudioStats>();
 const settings={cpu:true,gpu:false,adaptive:true,cache:true,responsive:true};
 
@@ -210,35 +211,81 @@ $('bgChoose').addEventListener('click',()=>($('bgFile') as HTMLInputElement).cli
 $('eco').addEventListener('click',()=>{$('eco').classList.toggle('on');$('profile').textContent=$('eco').classList.contains('on')?'eco':'balanced';});
 document.querySelectorAll<HTMLButtonElement>('.switch[data-toggle]').forEach(b=>b.addEventListener('click',()=>b.classList.toggle('on')));
 const runtimeNavigator=navigator as Navigator & {ml?:any;gpu?:any};
-$('webnn').textContent=runtimeNavigator.ml?.createContext?'available':'not exposed · CPU path';
+$('webnn').textContent=runtimeNavigator.ml?.createContext?'available':'optional · not exposed';
 $('cores').textContent=String(navigator.hardwareConcurrency||'—');
 $('memoryHint').textContent=(navigator as Navigator & {deviceMemory?:number}).deviceMemory?String((navigator as Navigator & {deviceMemory?:number}).deviceMemory)+' GB hint':'unavailable';
-$('gpuStatus').textContent=(runtimeNavigator.ml?.createContext&&runtimeNavigator.gpu?.requestAdapter)?'ready':'unavailable';
+$('gpuStatus').textContent=runtimeNavigator.gpu?.requestAdapter?'ready':'unavailable';
+
+async function probeWebGpu():Promise<{device:any;adapter:any}|null>{
+  const nav=navigator as Navigator & {gpu?:any};
+  if(!nav.gpu?.requestAdapter)return null;
+  const adapter=await nav.gpu.requestAdapter();
+  if(!adapter?.requestDevice)return null;
+  const device=await adapter.requestDevice();
+  if(!device)return null;
+
+  // Real compute probe: this confirms the device can execute a compute pass,
+  // rather than treating navigator.gpu presence as proof of working GPU use.
+  const shader=device.createShaderModule?.({code:`
+    @group(0) @binding(0) var<storage,read_write> data: array<f32>;
+    @compute @workgroup_size(1)
+    fn main() {
+      data[0] = data[0] * 2.0;
+    }
+  `});
+  if(shader&&device.createBuffer&&device.createBindGroupLayout&&device.createPipeline){
+    const buffer=device.createBuffer({size:16,usage:0x80|0x08});
+    const staging=device.createBuffer({size:16,usage:0x01|0x08});
+    const layout=device.createBindGroupLayout({entries:[{binding:0,visibility:4,buffer:{type:'storage'}}]});
+    const pipeline=device.createComputePipeline({layout:device.createPipelineLayout({bindGroupLayouts:[layout]}),compute:{module:shader,entryPoint:'main'}});
+    const bindGroup=device.createBindGroup({layout,entries:[{binding:0,resource:{buffer}}]});
+    const encoder=device.createCommandEncoder();
+    const pass=encoder.beginComputePass();
+    pass.setPipeline(pipeline); pass.setBindGroup(0,bindGroup); pass.dispatchWorkgroups(1); pass.end();
+    encoder.copyBufferToBuffer(buffer,0,staging,0,16);
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone?.();
+    buffer.destroy?.(); staging.destroy?.();
+  }
+  return {device,adapter};
+}
 
 async function setGpu(on:boolean){
   const nav=navigator as Navigator & {ml?:any;gpu?:any};
   if(!on){
-    gpuDevice?.destroy?.(); gpuDevice=null; webnnContext=null; settings.gpu=false;
+    gpuDevice?.destroy?.(); gpuDevice=null; webnnContext=null; gpuComputeReady=false; settings.gpu=false;
     $('gpuStatus').textContent='off'; refreshProfile(); return;
   }
-  if(!nav.ml?.createContext||!nav.gpu?.requestAdapter){
-    $('gpuStatus').textContent='unavailable'; $('gpuToggle').classList.remove('on'); $('gpuToggle').setAttribute('aria-pressed','false');
-    settings.gpu=false; log('gpu: WebGPU/WebNN is not available; CPU DSP remains active.'); refreshProfile(); return;
-  }
+
   try{
-    const adapter=await nav.gpu.requestAdapter();
-    const device=await adapter?.requestDevice?.();
-    if(!device)throw new Error('No GPU device was granted.');
-    webnnContext=await nav.ml.createContext(device);
-    gpuDevice=device; settings.gpu=true; $('gpuStatus').textContent='active';
-    log('gpu: GPU-backed WebNN context ready for ML inference.');
+    const gpu=await probeWebGpu();
+    if(!gpu)throw new Error('WebGPU is not available or could not create a device.');
+    gpuDevice=gpu.device;
+    gpuComputeReady=true;
+
+    if(nav.ml?.createContext){
+      try{
+        webnnContext=await nav.ml.createContext(gpu.device);
+        log('gpu: WebGPU compute device ready; WebNN ML context also available.');
+      }catch{
+        webnnContext=null;
+        log('gpu: WebGPU compute device ready; WebNN ML context unavailable, using GPU compute path.');
+      }
+    }else{
+      webnnContext=null;
+      log('gpu: WebGPU compute device ready; WebNN is not exposed in this browser.');
+    }
+
+    settings.gpu=true;
+    $('gpuStatus').textContent='active';
   }catch(err){
-    gpuDevice?.destroy?.(); gpuDevice=null; webnnContext=null; settings.gpu=false;
-    $('gpuToggle').classList.remove('on'); $('gpuToggle').setAttribute('aria-pressed','false'); $('gpuStatus').textContent='fallback CPU';
-    log('gpu: setup failed • '+(err instanceof Error?err.message:'unknown error'));
+    gpuDevice?.destroy?.(); gpuDevice=null; webnnContext=null; gpuComputeReady=false; settings.gpu=false;
+    $('gpuToggle').classList.remove('on'); $('gpuToggle').setAttribute('aria-pressed','false'); $('gpuStatus').textContent='unavailable';
+    log('gpu: '+(err instanceof Error?err.message:'unknown GPU setup error')+'; CPU remains active.');
   }
   refreshProfile();
 }
+
 function refreshProfile(){
   const parts=[settings.cpu?'CPU DSP':'CPU off',settings.gpu?'GPU ML':'GPU off',settings.adaptive?'adaptive':'fixed',settings.cache?'cache':'no cache',settings.responsive?'responsive':'max throughput'];
   $('profile').textContent=parts.join(' · ');
