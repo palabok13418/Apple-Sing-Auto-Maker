@@ -14,6 +14,7 @@ let backing:FileSlot|null=null;
 let passed=false;
 let output='';
 let audioContext:AudioContext|null=null;
+let gpuAdapter:any=null;
 let gpuDevice:{destroy?:()=>void}|null=null;
 let webnnContext:unknown=null;
 let gpuComputeReady=false;
@@ -199,13 +200,41 @@ function alignmentLanguage(lang:string):string|undefined{
   const map:Record<string,string>={'en-US':'english',ja:'japanese',ko:'korean','zh-Hans':'chinese',fil:'tagalog'};
   return map[lang];
 }
+function configureAlignmentRuntime(mod:any,useGpu:boolean,adapter:any):void{
+  try{
+    const onnx=mod?.env?.backends?.onnx;
+    // Keep expected ONNX Runtime placement chatter out of the browser console.
+    // Inference errors remain visible through the normal error path.
+    if(onnx?.env){
+      try{onnx.env.logLevel='error';}catch(e){}
+    }
+    // Transformers.js 3.x/ORT may expose an adapter hook. Reuse the adapter
+    // already validated by the app so ORT does not need to probe Windows again.
+    if(useGpu&&adapter&&onnx?.webgpu){
+      try{onnx.webgpu.adapter=adapter;}catch(e){}
+    }
+  }catch(e){}
+}
+
+function resetAlignmentPipeline():void{
+  // A pipeline is bound to its execution backend. Recreate it after a GPU toggle.
+  alignmentPipelinePromise=null;
+}
+
 async function getAlignmentPipeline():Promise<any>{
   if(alignmentPipelinePromise)return alignmentPipelinePromise;
   alignmentPipelinePromise=(async()=>{
     const load=new Function('u','return import(u)') as (u:string)=>Promise<any>;
     const mod=await load('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm');
+    const useGpu=settings.gpu&&gpuComputeReady;
+    configureAlignmentRuntime(mod,useGpu,gpuAdapter);
     return mod.pipeline('automatic-speech-recognition','onnx-community/whisper-tiny',{
-      device:settings.gpu&&gpuComputeReady?'webgpu':'wasm'
+      device:useGpu?'webgpu':'wasm',
+      // Whisper Tiny publishes matching fp16 encoder/merged-decoder ONNX weights.
+      dtype:useGpu?'fp16':'fp32',
+      // ORT's node-placement warnings are not actionable for this workload.
+      // Severity 3 keeps actual errors while hiding warning-level placement logs.
+      session_options:{logSeverityLevel:3}
     });
   })();
   return alignmentPipelinePromise;
@@ -621,15 +650,18 @@ async function probeWebGpu():Promise<{device:any;adapter:any}|null>{
 async function setGpu(on:boolean){
   const nav=navigator as Navigator & {ml?:any;gpu?:any};
   if(!on){
-    gpuDevice?.destroy?.(); gpuDevice=null; webnnContext=null; gpuComputeReady=false; settings.gpu=false;
+    resetAlignmentPipeline();
+    gpuDevice?.destroy?.(); gpuDevice=null; gpuAdapter=null; webnnContext=null; gpuComputeReady=false; settings.gpu=false;
     $('gpuStatus').textContent='off'; refreshProfile(); return;
   }
 
   try{
     const gpu=await probeWebGpu();
     if(!gpu)throw new Error('WebGPU is not available or could not create a device.');
+    gpuAdapter=gpu.adapter;
     gpuDevice=gpu.device;
     gpuComputeReady=true;
+    resetAlignmentPipeline();
 
     if(nav.ml?.createContext){
       try{
