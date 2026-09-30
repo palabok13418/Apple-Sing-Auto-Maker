@@ -224,7 +224,7 @@ async function getAlignmentPipeline():Promise<any>{
     const mod=await load('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm');
     const useGpu=settings.gpu&&gpuComputeReady;
     configureAlignmentRuntime(mod);
-    return mod.pipeline('automatic-speech-recognition','onnx-community/whisper-tiny',{
+    return mod.pipeline('automatic-speech-recognition','onnx-community/whisper-tiny_timestamped',{
       device:useGpu?'webgpu':'wasm',
       // Whisper Tiny publishes matching fp16 encoder/merged-decoder ONNX weights.
       dtype:useGpu?{encoder_model:'fp32',decoder_model_merged:'q4'}:'q8',
