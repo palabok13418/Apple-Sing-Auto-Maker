@@ -506,7 +506,8 @@ $('analyze').addEventListener('click',async()=>{
     const a=await analyzeSlot(lead,'lead',2,46); const b=await analyzeSlot(backing,'backing',48,46);
     const threshold=.60; const leadOk=a>=threshold, backingOk=b>=threshold, ok=leadOk&&backingOk; passed=ok;
     $('leadCard').classList.toggle('good',leadOk); $('leadCard').classList.toggle('bad',!leadOk); $('bgCard').classList.toggle('good',backingOk); $('bgCard').classList.toggle('bad',!backingOk);
-    const v2Detected=(lead.stats?.secondaryVoicePeak??0)>=.62; const bgDetected=(backing.stats?.vocalCoverage??0)>=.045&&(backing.stats?.vocalActivity??0)>=.44&&b>=threshold;
+    const v2Detected=(lead.stats?.secondaryVoicePeak??0)>=.62&&lead.stats?.secondaryIntervals.length>0;
+    const bgDetected=(backing.stats?.vocalCoverage??0)>=.045&&(backing.stats?.vocalActivity??0)>=.44&&backing.stats?.vocalIntervals.length>0&&backing.stats?.syllablePeaks.length>=2&&b>=threshold;
     $('v2Status').textContent=v2Detected?'detected • '+Math.round((lead.stats?.secondaryVoice??0)*100)+'%':'not detected • '+Math.round((lead.stats?.secondaryVoice??0)*100)+'%';
     $('bgStatus').textContent=bgDetected?'detected • '+Math.round((backing.stats?.vocalActivity??0)*100)+'%':'not detected • '+Math.round((backing.stats?.vocalActivity??0)*100)+'%';
     log('v2 detection: '+(v2Detected?'SECOND VOICE DETECTED':'no second-voice signal')); log('bg detection: '+(bgDetected?'BACKGROUND VOCAL ACTIVITY DETECTED':'no background-vocal activity detected'));
@@ -554,6 +555,8 @@ async function makeTtml(onProgress:(value:number,label:string,detail:string)=>vo
   const lines=getLyricLines();
   if(!lines.length)throw new Error('Enter at least one lyric line before generating.');
   if(!lead?.stats||!backing?.stats)throw new Error('Analyze both stems before generating.');
+  if(lead.stats.syllablePeaks.length<2)throw new Error('Lead audio did not contain enough stable vocal timing anchors for real alignment.');
+  if(backing.stats.vocalIntervals.length<1)throw new Error('Backing audio did not contain a stable vocal region for BG analysis.');
 
   const durationMs=Math.max(1000,Math.max(lead.stats.duration,backing.stats.duration)*1000);
   const leadIntervals=normalizeIntervals(lead.stats.vocalIntervals,durationMs/1000,.10);
@@ -561,7 +564,7 @@ async function makeTtml(onProgress:(value:number,label:string,detail:string)=>vo
   const backingIntervals=normalizeIntervals(backing.stats.vocalIntervals,durationMs/1000,.10);
   const secondaryCoverage=secondaryIntervals.reduce((n,x)=>n+Math.max(0,x.end-x.start),0);
   const v2Detected=(lead.stats.secondaryVoicePeak??0)>=.62&&secondaryIntervals.length>0&&secondaryCoverage>=.08;
-  const bgDetected=(backing.stats.vocalCoverage??0)>=.045&&(backing.stats.vocalActivity??0)>=.44&&backingIntervals.length>0&&(backing.score??0)>=.60;
+  const bgDetected=(backing.stats.vocalCoverage??0)>=.045&&(backing.stats.vocalActivity??0)>=.44&&backingIntervals.length>0&&backing.stats.syllablePeaks.length>=2&&(backing.score??0)>=.60;
   const allowV2=qs<HTMLButtonElement>('[data-toggle="v2"]').classList.contains('on');
   const allowBg=qs<HTMLButtonElement>('[data-toggle="bg"]').classList.contains('on');
   const autoV2=v2Detected&&allowV2;
