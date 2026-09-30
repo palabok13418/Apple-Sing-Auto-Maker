@@ -333,7 +333,7 @@ async function inspect(file, onProgress) {
     backingPeaks: evidence.peaks
   };
   let peak = 0;
-  for (const x of secondaryIntervals) peak = Math.max(peak, 0.63);
+  for (let w = 0; w < secondaryIntervals.length; w++) peak = Math.max(peak, secondaryVoice / Math.max(1, secondaryIntervals.length));
   stats.secondaryVoicePeak = peak;
   if (settings.cache) analysisCache.set(key, stats);
   return stats;
@@ -546,7 +546,7 @@ function alignmentToUnits(alignment, peaks, lang) {
     line.words.forEach((word, wi) => {
       refineWordSyllables(word.text, word.start * 1000, word.end * 1000, lang, peaks).forEach(u => syllables.push({ text: u.text, begin: u.begin, end: u.end, wordIndex: wi }));
     });
-    return { text: line.text, begin: line.begin, end: line.end, syllables };
+    return { text: line.text, begin: line.begin * 1000, end: line.end * 1000, syllables };
   });
 }
 function escapeXmlText(text) {
@@ -578,8 +578,9 @@ function overlapSeconds(a, b) {
 }
 function lineHasSecondary(line, intervals) {
   if (line.begin == null || line.end == null) return false;
-  const span = Math.max(0.001, line.end - line.begin);
-  const overlap = intervals.reduce((sum, x) => sum + Math.max(0, Math.min(x.end, line.end) - Math.max(x.start, line.begin)), 0);
+  const begin = line.begin / 1000, end = line.end / 1000;
+  const span = Math.max(0.001, end - begin);
+  const overlap = intervals.reduce((sum, x) => sum + Math.max(0, Math.min(x.end, end) - Math.max(x.start, begin)), 0);
   return overlap / span >= 0.18;
 }
 function renderLine(line, index, backingLine, backingEvidence, secondaryIntervals, autoV2, autoBg, lang) {
