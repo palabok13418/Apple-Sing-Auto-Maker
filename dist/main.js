@@ -14,6 +14,7 @@ let backing = null;
 let passed = false;
 let output = '';
 let audioContext = null;
+let gpuAdapter = null;
 let gpuDevice = null;
 let webnnContext = null;
 let alignmentPipelinePromise = null;
@@ -610,12 +611,32 @@ function renderLine(line, index, backingLine, backingEvidence, secondaryInterval
 function alignmentLanguage(lang) {
   return ({ 'en-US': 'english', ja: 'japanese', ko: 'korean', 'zh-Hans': 'chinese', fil: 'tagalog' })[lang];
 }
+function configureAlignmentRuntime(mod, useGpu, adapter) {
+  try {
+    const onnx = mod?.env?.backends?.onnx;
+    if (onnx?.env) {
+      try { onnx.env.logLevel = 'error'; } catch (e) {}
+    }
+    if (useGpu && adapter && onnx?.webgpu) {
+      try { onnx.webgpu.adapter = adapter; } catch (e) {}
+    }
+  } catch (e) {}
+}
+
+function resetAlignmentPipeline() {
+  alignmentPipelinePromise = null;
+}
+
 async function getAlignmentPipeline() {
   if (alignmentPipelinePromise) return alignmentPipelinePromise;
   alignmentPipelinePromise = (async () => {
     const mod = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm');
+    const useGpu = settings.gpu && gpuAdapter;
+    configureAlignmentRuntime(mod, useGpu, gpuAdapter);
     return mod.pipeline('automatic-speech-recognition', 'onnx-community/whisper-tiny', {
-      device: settings.gpu ? 'webgpu' : 'wasm'
+      device: useGpu ? 'webgpu' : 'wasm',
+      dtype: useGpu ? 'fp16' : 'fp32',
+      session_options: { logSeverityLevel: 3 }
     });
   })();
   return alignmentPipelinePromise;
@@ -691,14 +712,17 @@ async function probeWebGpu() {
 }
 async function setGpu(on) {
   if (!on) {
+    resetAlignmentPipeline();
     if (gpuDevice && gpuDevice.destroy) gpuDevice.destroy();
-    gpuDevice = null; webnnContext = null; settings.gpu = false;
+    gpuDevice = null; gpuAdapter = null; webnnContext = null; settings.gpu = false;
     $('gpuStatus').textContent = 'off'; refreshProfile(); return;
   }
   try {
     const gpu = await probeWebGpu();
     if (!gpu) throw new Error('WebGPU is not available.');
+    gpuAdapter = gpu.adapter;
     gpuDevice = gpu.device;
+    resetAlignmentPipeline();
     if (navigator.ml && navigator.ml.createContext) {
       try { webnnContext = await navigator.ml.createContext(gpu.device); } catch { webnnContext = null; }
     }
