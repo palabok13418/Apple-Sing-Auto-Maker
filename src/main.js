@@ -303,7 +303,7 @@ async function inspect(file, onProgress) {
   }
   const channel = buffer.getChannelData(0);
   const step = Math.max(1, Math.floor(channel.length / plan.windows));
-  let rms = 0, zcr = 0, centroid = 0, flatness = 0, lowRatio = 0, harmonicity = 0, secondaryVoice = 0, vocalActivity = 0;
+  let rms = 0, zcr = 0, centroid = 0, flatness = 0, lowRatio = 0, harmonicity = 0, secondaryVoice = 0, secondaryVoicePeak = 0, vocalActivity = 0;
   const secondaryIntervals = [];
   for (let w = 0; w < plan.windows; w++) {
     const center = Math.min(channel.length - 1, Math.floor((w + 0.5) * step));
@@ -312,7 +312,7 @@ async function inspect(file, onProgress) {
     if (slice.length >= 64) {
       const f = fftFeatures(slice, buffer.sampleRate, plan.fftSize);
       rms += f.rms; zcr += f.zcr; centroid += f.centroid; flatness += f.flatness; lowRatio += f.lowRatio;
-      harmonicity += f.harmonicity; secondaryVoice += f.secondaryVoice; vocalActivity += f.vocalActivity;
+      harmonicity += f.harmonicity; secondaryVoice += f.secondaryVoice; secondaryVoicePeak = Math.max(secondaryVoicePeak, f.secondaryVoice); vocalActivity += f.vocalActivity;
       if (f.secondaryVoice >= 0.62) secondaryIntervals.push({ start: Math.max(0, center - half) / buffer.sampleRate, end: Math.min(channel.length, center + half) / buffer.sampleRate });
     }
     onProgress((w + 1) / plan.windows);
@@ -325,16 +325,14 @@ async function inspect(file, onProgress) {
     sampleRate: buffer.sampleRate,
     channels: buffer.numberOfChannels,
     rms: rms / n, zcr: zcr / n, centroid: centroid / n, flatness: flatness / n, lowRatio: lowRatio / n,
-    harmonicity: harmonicity / n, secondaryVoice: secondaryVoice / n, secondaryVoicePeak: secondaryVoice ? Math.max(...secondaryIntervals.map(() => 0), 0) : 0,
+    harmonicity: harmonicity / n, secondaryVoice: secondaryVoice / n, secondaryVoicePeak,
     vocalActivity: vocalActivity / n, vocalCoverage: evidence.coverage,
     secondaryIntervals: normalizeIntervals(secondaryIntervals, buffer.duration, 0.10),
     vocalIntervals: evidence.intervals,
     syllablePeaks: evidence.peaks,
     backingPeaks: evidence.peaks
   };
-  let peak = 0;
-  for (let w = 0; w < secondaryIntervals.length; w++) peak = Math.max(peak, secondaryVoice / Math.max(1, secondaryIntervals.length));
-  stats.secondaryVoicePeak = peak;
+
   if (settings.cache) analysisCache.set(key, stats);
   return stats;
 }
