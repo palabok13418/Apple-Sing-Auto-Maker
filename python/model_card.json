@@ -1,9 +1,11 @@
 {
-  "model": "tiny-stem-purity-classifier",
+  "model": "tiny-stem-purity-softmax",
   "deployment": "client",
   "target": "low-end CPU",
-  "quantization": "int8",
+  "training": "offline multinomial softmax with standardized audio features",
+  "features": ["rms", "zcr", "centroid", "flatness", "low_ratio", "harmonicity", "vocal_activity", "vocal_coverage", "secondary_voice"],
   "classes": ["lead", "backing", "reject"],
   "policy": "reject ambiguous or mixed audio",
-  "features": ["rms", "zcr", "centroid", "flatness", "low_ratio", "harmonicity"]
+  "reject_class_weight": 1.7,
+  "browser_gate": "compact calibrated feature ensemble; retrain the exported model with real labeled stems before production deployment"
 }
