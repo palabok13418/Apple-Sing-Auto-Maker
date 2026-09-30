@@ -17,42 +17,106 @@ function bindInput(inputId, cardId, metaId, assign) {
     card.addEventListener('dragleave', () => card.classList.remove('drag'));
     card.addEventListener('drop', e => { e.preventDefault(); card.classList.remove('drag'); const f = e.dataTransfer?.files?.[0]; if (!f) return; assign(f); showFile(inputId === 'leadFile' ? 'lead' : 'backing', f); card.classList.remove('good', 'bad'); passed = false; setGate('wait', lead && backing ? 'Both stems loaded. Analyze them to continue.' : 'Waiting for both files.'); $('generate').setAttribute('disabled', 'true'); });
 }
-function fftLike(samples) {
-    const n = Math.min(samples.length, 4096);
-    let rms = 0, zcr = 0, centroid = 0, total = 0, logSum = 0, low = 0, peak = 0;
+function fftLike(samples, sampleRate) {
+    const n = Math.min(samples.length, 2048);
+    let rms = 0, zcr = 0;
     for (let i = 0; i < n; i++) {
-        const x = samples[i] ?? 0; rms += x * x;
-        if (i > 0 && ((samples[i - 1] ?? 0) >= 0) != (x >= 0)) zcr++;
-        const a = Math.abs(x); total += a; centroid += i * a; peak = Math.max(peak, a);
-        if (i < Math.floor(n * .2)) low += a; logSum += Math.log(a + 1e-8);
+        const x = samples[i] ?? 0;
+        rms += x * x;
+        if (i > 0 && ((samples[i - 1] ?? 0) >= 0) != (x >= 0))
+            zcr++;
     }
-    rms = Math.sqrt(rms / n); zcr /= n; centroid = total ? centroid / total / n : 0;
-    const arith = total / n + 1e-8; const geo = Math.exp(logSum / n);
-    const flatness = geo / arith; const lowRatio = low / (total + 1e-8);
-    const harmonicity = Math.min(1, Math.max(0, (peak / (rms + 1e-6) - 1) / 20));
+    rms = Math.sqrt(rms / Math.max(1, n));
+    zcr /= Math.max(1, n);
+    const bins = Math.floor(n / 2);
+    let total = 0, weighted = 0, logSum = 0, low = 0;
+    const mags = new Float64Array(bins);
+    for (let k = 0; k < bins; k++) {
+        let re = 0, im = 0;
+        const freq = k * sampleRate / n;
+        for (let i = 0; i < n; i++) {
+            const x = samples[i] ?? 0;
+            const window = .5 * (1 - Math.cos(2 * Math.PI * i / Math.max(1, n - 1)));
+            const phase = 2 * Math.PI * k * i / n;
+            re += x * window * Math.cos(phase);
+            im -= x * window * Math.sin(phase);
+        }
+        const mag = Math.hypot(re, im);
+        mags[k] = mag;
+        total += mag;
+        weighted += freq * mag;
+        if (freq <= 300)
+            low += mag;
+        logSum += Math.log(mag + 1e-12);
+    }
+    const centroid = total ? Math.min(1, weighted / total / (sampleRate / 2)) : 0;
+    const arith = total / Math.max(1, bins) + 1e-12;
+    const geo = Math.exp(logSum / Math.max(1, bins));
+    const flatness = Math.max(0, Math.min(1, geo / arith));
+    const lowRatio = total ? low / total : 0;
+    let harmonicity = 0;
+    const minLag = Math.max(2, Math.floor(sampleRate / 500));
+    const maxLag = Math.min(Math.floor(sampleRate / 70), Math.floor(n / 2));
+    let energy = 0;
+    for (let i = 0; i < n; i++) {
+        const x = samples[i] ?? 0;
+        energy += x * x;
+    }
+    if (energy > 1e-8 && maxLag > minLag) {
+        for (let lag = minLag; lag <= maxLag; lag += 2) {
+            let corr = 0, ea = 0, eb = 0;
+            for (let i = 0; i < n - lag; i++) {
+                const a = samples[i] ?? 0, b = samples[i + lag] ?? 0;
+                corr += a * b;
+                ea += a * a;
+                eb += b * b;
+            }
+            const normalized = corr / Math.sqrt((ea + 1e-12) * (eb + 1e-12));
+            harmonicity = Math.max(harmonicity, Math.max(0, normalized));
+        }
+    }
     return { rms, zcr, centroid, flatness, lowRatio, harmonicity };
 }
 async function inspect(file) {
     try {
-        const AC = window.AudioContext ?? window.webkitAudioContext; if (!AC) return null;
-        const ctx = new AC(); const buffer = await ctx.decodeAudioData(await file.arrayBuffer());
-        const ch = buffer.getChannelData(0); const windows = Number($('eco').classList.contains('on') ? 16 : 32);
+        const AC = window.AudioContext ?? window.webkitAudioContext;
+        if (!AC)
+            return null;
+        const ctx = new AC();
+        const buffer = await ctx.decodeAudioData(await file.arrayBuffer());
+        const ch = buffer.getChannelData(0);
+        const windows = Number($('eco').classList.contains('on') ? 16 : 32);
         const step = Math.max(1, Math.floor(ch.length / windows));
-        let acc = { rms: 0, zcr: 0, centroid: 0, flatness: 0, lowRatio: 0, harmonicity: 0 }; let count = 0;
+        let acc = { rms: 0, zcr: 0, centroid: 0, flatness: 0, lowRatio: 0, harmonicity: 0 };
+        let count = 0;
         for (let w = 0; w < windows; w++) {
-            const start = Math.min(ch.length - 1, w * step); const end = Math.min(ch.length, start + Math.min(step, 8192));
-            const slice = ch.subarray(start, end); if (!slice.length) continue; const f = fftLike(slice);
-            for (const k of Object.keys(acc)) acc[k] += f[k]; count++;
+            const center = Math.min(ch.length - 1, Math.floor((w + .5) * step));
+            const half = Math.min(1024, Math.floor(step / 2));
+            const start = Math.max(0, center - half);
+            const end = Math.min(ch.length, start + Math.max(256, half * 2));
+            const slice = ch.subarray(start, end);
+            if (slice.length < 64)
+                continue;
+            const f = fftLike(slice, buffer.sampleRate);
+            for (const k of Object.keys(acc))
+                acc[k] += f[k];
+            count++;
         }
-        await ctx.close(); for (const k of Object.keys(acc)) acc[k] /= Math.max(1, count);
+        await ctx.close();
+        for (const k of Object.keys(acc))
+            acc[k] /= Math.max(1, count);
         return { duration: buffer.duration, sampleRate: buffer.sampleRate, channels: buffer.numberOfChannels, ...acc };
-    } catch { return null; }
+    }
+    catch {
+        return null;
+    }
 }
 function classify(s) {
-    const vocal = Math.max(0, 1 - Math.min(1, s.lowRatio * 1.8)); const harmonic = Math.min(1, s.harmonicity);
-    const stable = Math.max(0, 1 - Math.min(1, Math.abs(s.centroid - .28) * 3));
-    const clean = Math.max(0, 1 - Math.min(1, s.flatness * 1.35)); const zcr = Math.max(0, 1 - Math.min(1, s.zcr * 7));
-    return Math.max(0, Math.min(1, .30 * vocal + .28 * harmonic + .19 * stable + .15 * clean + .08 * zcr));
+    const voiced = Math.min(1, Math.max(0, s.harmonicity * .9 + (1 - s.zcr * 5) * .1));
+    const vocalBand = Math.max(0, 1 - Math.abs(s.lowRatio - .22) * 2.8);
+    const midCentroid = Math.max(0, 1 - Math.abs(s.centroid - .28) * 2.4);
+    const tonal = Math.max(0, 1 - s.flatness * .9);
+    return Math.max(0, Math.min(1, .42 * voiced + .24 * vocalBand + .20 * midCentroid + .14 * tonal));
 }
 async function analyzeSlot(slot, label) { log(`${label}: decoding analysis windows…`); const stats = await inspect(slot.file); if (!stats) throw new Error(`${label} could not be decoded.`); slot.stats = stats; slot.score = classify(stats); log(`${label}: ${stats.duration.toFixed(2)}s • ${stats.sampleRate} Hz • ${stats.channels}ch • confidence ${(slot.score * 100).toFixed(1)}%`); return slot.score; }
 bindInput('leadFile', 'leadCard', 'leadMeta', f => lead = { file: f });
@@ -66,10 +130,25 @@ $('analyze').addEventListener('click', async () => {
     if (!lead || !backing) { setGate('bad', 'Both Lead Vocals and Backing Vocals are required.'); return; }
     $('analyze').setAttribute('disabled', 'true'); setGate('wait', 'Analyzing both stems…'); log('gate: starting compact feature pass…');
     try {
-        const [a, b] = await Promise.all([analyzeSlot(lead, 'lead'), analyzeSlot(backing, 'backing')]); const threshold = .78; const ok = a >= threshold && b >= threshold;
-        passed = ok; $('leadCard').classList.toggle('good', ok); $('bgCard').classList.toggle('good', ok); $('leadCard').classList.toggle('bad', !ok); $('bgCard').classList.toggle('bad', !ok);
-        if (ok) { setGate('ok', 'Both stems passed the conservative purity gate. Generation unlocked.'); $('generate').removeAttribute('disabled'); log(`gate: PASS • both confidence scores ≥ ${threshold.toFixed(2)}`); }
-        else { setGate('bad', `Rejected. Both files need confidence ≥ ${(threshold * 100).toFixed(0)}% for this conservative prototype gate.`); $('generate').setAttribute('disabled', 'true'); log('gate: REJECT • generation blocked'); }
+        const [a, b] = await Promise.all([analyzeSlot(lead, 'lead'), analyzeSlot(backing, 'backing')]);
+        const threshold = .60;
+        const leadOk = a >= threshold, backingOk = b >= threshold, ok = leadOk && backingOk;
+        passed = ok;
+        $('leadCard').classList.toggle('good', leadOk);
+        $('leadCard').classList.toggle('bad', !leadOk);
+        $('bgCard').classList.toggle('good', backingOk);
+        $('bgCard').classList.toggle('bad', !backingOk);
+        if (ok) {
+            setGate('ok', `Both stems passed the vocal-admission gate (${(a * 100).toFixed(0)}% / ${(b * 100).toFixed(0)}%). Generation unlocked.`);
+            $('generate').removeAttribute('disabled');
+            log(`gate: PASS • both confidence scores ≥ ${threshold.toFixed(2)}`);
+        }
+        else {
+            const failed = [leadOk ? '' : `lead ${(a * 100).toFixed(0)}%`, backingOk ? '' : `backing ${(b * 100).toFixed(0)}%`].filter(Boolean).join(', ');
+            setGate('bad', `Rejected: ${failed}. Add a cleaner isolated vocal stem and analyze again.`);
+            $('generate').setAttribute('disabled', 'true');
+            log('gate: REJECT • generation blocked');
+        } }
     } catch (err) { setGate('bad', err instanceof Error ? err.message : 'Analysis failed.'); log('gate: ERROR'); }
     $('analyze').removeAttribute('disabled');
 });
