@@ -303,7 +303,7 @@ async function inspect(file, onProgress) {
   }
   const channel = buffer.getChannelData(0);
   const step = Math.max(1, Math.floor(channel.length / plan.windows));
-  let rms = 0, zcr = 0, centroid = 0, flatness = 0, lowRatio = 0, harmonicity = 0, secondaryVoice = 0, vocalActivity = 0;
+  let rms = 0, zcr = 0, centroid = 0, flatness = 0, lowRatio = 0, harmonicity = 0, secondaryVoice = 0, secondaryVoicePeak = 0, vocalActivity = 0;
   const secondaryIntervals = [];
   for (let w = 0; w < plan.windows; w++) {
     const center = Math.min(channel.length - 1, Math.floor((w + 0.5) * step));
@@ -312,7 +312,7 @@ async function inspect(file, onProgress) {
     if (slice.length >= 64) {
       const f = fftFeatures(slice, buffer.sampleRate, plan.fftSize);
       rms += f.rms; zcr += f.zcr; centroid += f.centroid; flatness += f.flatness; lowRatio += f.lowRatio;
-      harmonicity += f.harmonicity; secondaryVoice += f.secondaryVoice; vocalActivity += f.vocalActivity;
+      harmonicity += f.harmonicity; secondaryVoice += f.secondaryVoice; secondaryVoicePeak = Math.max(secondaryVoicePeak, f.secondaryVoice); vocalActivity += f.vocalActivity;
       if (f.secondaryVoice >= 0.62) secondaryIntervals.push({ start: Math.max(0, center - half) / buffer.sampleRate, end: Math.min(channel.length, center + half) / buffer.sampleRate });
     }
     onProgress((w + 1) / plan.windows);
@@ -325,16 +325,14 @@ async function inspect(file, onProgress) {
     sampleRate: buffer.sampleRate,
     channels: buffer.numberOfChannels,
     rms: rms / n, zcr: zcr / n, centroid: centroid / n, flatness: flatness / n, lowRatio: lowRatio / n,
-    harmonicity: harmonicity / n, secondaryVoice: secondaryVoice / n, secondaryVoicePeak: secondaryVoice ? Math.max(...secondaryIntervals.map(() => 0), 0) : 0,
+    harmonicity: harmonicity / n, secondaryVoice: secondaryVoice / n, secondaryVoicePeak,
     vocalActivity: vocalActivity / n, vocalCoverage: evidence.coverage,
     secondaryIntervals: normalizeIntervals(secondaryIntervals, buffer.duration, 0.10),
     vocalIntervals: evidence.intervals,
     syllablePeaks: evidence.peaks,
     backingPeaks: evidence.peaks
   };
-  let peak = 0;
-  for (const x of secondaryIntervals) peak = Math.max(peak, 0.63);
-  stats.secondaryVoicePeak = peak;
+
   if (settings.cache) analysisCache.set(key, stats);
   return stats;
 }
@@ -546,7 +544,7 @@ function alignmentToUnits(alignment, peaks, lang) {
     line.words.forEach((word, wi) => {
       refineWordSyllables(word.text, word.start * 1000, word.end * 1000, lang, peaks).forEach(u => syllables.push({ text: u.text, begin: u.begin, end: u.end, wordIndex: wi }));
     });
-    return { text: line.text, begin: line.begin, end: line.end, syllables };
+    return { text: line.text, begin: line.begin * 1000, end: line.end * 1000, syllables };
   });
 }
 function escapeXmlText(text) {
@@ -578,8 +576,9 @@ function overlapSeconds(a, b) {
 }
 function lineHasSecondary(line, intervals) {
   if (line.begin == null || line.end == null) return false;
-  const span = Math.max(0.001, line.end - line.begin);
-  const overlap = intervals.reduce((sum, x) => sum + Math.max(0, Math.min(x.end, line.end) - Math.max(x.start, line.begin)), 0);
+  const begin = line.begin / 1000, end = line.end / 1000;
+  const span = Math.max(0.001, end - begin);
+  const overlap = intervals.reduce((sum, x) => sum + Math.max(0, Math.min(x.end, end) - Math.max(x.start, begin)), 0);
   return overlap / span >= 0.18;
 }
 function renderLine(line, index, backingLine, backingEvidence, secondaryIntervals, autoV2, autoBg, lang) {
