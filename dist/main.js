@@ -14,8 +14,6 @@ let backing = null;
 let passed = false;
 let output = '';
 let audioContext = null;
-let gpuAdapter = null;
-let gpuDevice = null;
 let webnnContext = null;
 let alignmentPipelinePromise = null;
 const analysisCache = new Map();
@@ -611,15 +609,15 @@ function renderLine(line, index, backingLine, backingEvidence, secondaryInterval
 function alignmentLanguage(lang) {
   return ({ 'en-US': 'english', ja: 'japanese', ko: 'korean', 'zh-Hans': 'chinese', fil: 'tagalog' })[lang];
 }
-function configureAlignmentRuntime(mod, useGpu, adapter) {
+function configureAlignmentRuntime(mod) {
   try {
     const onnx = mod?.env?.backends?.onnx;
     if (onnx?.env) {
       try { onnx.env.logLevel = 'error'; } catch (e) {}
     }
-    if (useGpu && adapter && onnx?.webgpu) {
-      try { onnx.webgpu.adapter = adapter; } catch (e) {}
-    }
+    // Do not inject an app-owned GPUAdapter into ORT. The availability probe
+    // deliberately does not consume an adapter; ONNX Runtime owns device
+    // creation for the actual Whisper WebGPU session.
   } catch (e) {}
 }
 
@@ -631,8 +629,8 @@ async function getAlignmentPipeline() {
   if (alignmentPipelinePromise) return alignmentPipelinePromise;
   alignmentPipelinePromise = (async () => {
     const mod = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm');
-    const useGpu = settings.gpu && gpuAdapter;
-    configureAlignmentRuntime(mod, useGpu, gpuAdapter);
+    const useGpu = settings.gpu;
+    configureAlignmentRuntime(mod);
     return mod.pipeline('automatic-speech-recognition', 'onnx-community/whisper-tiny', {
       device: useGpu ? 'webgpu' : 'wasm',
       dtype: useGpu ? { encoder_model: 'fp32', decoder_model_merged: 'q4' } : 'q8',
@@ -704,34 +702,33 @@ $('gpuStatus').textContent = runtimeNavigator.gpu && runtimeNavigator.gpu.reques
 async function probeWebGpu() {
   const nav = navigator;
   if (!nav.gpu || !nav.gpu.requestAdapter) return null;
+  // Availability check only. Do not call adapter.requestDevice() here because
+  // ONNX Runtime must own the adapter's device.
   const adapter = await nav.gpu.requestAdapter();
-  if (!adapter || !adapter.requestDevice) return null;
-  const device = await adapter.requestDevice();
-  if (!device) return null;
-  return { device, adapter };
+  return adapter ? { adapter } : null;
 }
 async function setGpu(on) {
   if (!on) {
     resetAlignmentPipeline();
-    if (gpuDevice && gpuDevice.destroy) gpuDevice.destroy();
-    gpuDevice = null; gpuAdapter = null; webnnContext = null; settings.gpu = false;
+    webnnContext = null; settings.gpu = false;
     $('gpuStatus').textContent = 'off'; refreshProfile(); return;
   }
   try {
     const gpu = await probeWebGpu();
     if (!gpu) throw new Error('WebGPU is not available.');
-    gpuAdapter = gpu.adapter;
-    gpuDevice = gpu.device;
     resetAlignmentPipeline();
     if (navigator.ml && navigator.ml.createContext) {
-      try { webnnContext = await navigator.ml.createContext(gpu.device); } catch { webnnContext = null; }
+      try {
+        webnnContext = await navigator.ml.createContext({ powerPreference: 'high-performance', accelerated: true });
+      } catch {
+        try { webnnContext = await navigator.ml.createContext(); } catch { webnnContext = null; }
+      }
     }
     settings.gpu = true;
     $('gpuStatus').textContent = 'active';
-    log('gpu: active WebGPU device' + (webnnContext ? ' + WebNN' : ''));
+    log('gpu: WebGPU adapter available; ONNX Runtime will own the inference device' + (webnnContext ? ' + WebNN' : ''));
   } catch (err) {
-    if (gpuDevice && gpuDevice.destroy) gpuDevice.destroy();
-    gpuDevice = null; webnnContext = null; settings.gpu = false;
+    webnnContext = null; settings.gpu = false;
     $('gpuToggle').classList.remove('on');
     $('gpuToggle').setAttribute('aria-pressed', 'false');
     $('gpuStatus').textContent = 'unavailable';
