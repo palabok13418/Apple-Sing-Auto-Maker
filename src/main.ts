@@ -198,12 +198,19 @@ function activeTimelineMap(activeMs:number,intervals:AudioInterval[],durationMs:
 function buildLyricLineTimeline(lines:string[],durationMs:number,lang:string,intervals:AudioInterval[]):LyricLineUnit[]{
   const weights=lines.map(line=>{const words=splitWords(line);return Math.max(1,words.reduce((n,w)=>n+splitSyllables(w,lang).reduce((m,s)=>m+syllableWeight(s),0),0));});
   const totalWeight=weights.reduce((a,b)=>a+b,0)||1; const activeMs=intervals.reduce((n,x)=>n+(x.end-x.start)*1000,0); const usableMs=activeMs>0?activeMs:durationMs; let cursor=0;
-  return lines.map((line,i)=>{const lineStart=activeTimelineMap(cursor,intervals,durationMs); cursor+=usableMs*weights[i]/totalWeight; let lineEnd=activeTimelineMap(cursor,intervals,durationMs); if(lineEnd<=lineStart)lineEnd=Math.min(durationMs,lineStart+80);
-    const words=splitWords(line); const syllables:SyllableUnit[]=[]; const wordDuration=Math.max(80,(lineEnd-lineStart)/Math.max(1,words.length)); let wordCursor=lineStart;
-    for(let wi=0;wi<words.length;wi++){const parts=splitSyllables(words[wi],lang);const sum=parts.reduce((n,p)=>n+syllableWeight(p),0)||1;const wordEnd=wi===words.length-1?lineEnd:Math.min(lineEnd,wordCursor+wordDuration);let c=wordCursor;
-      for(let si=0;si<parts.length;si++){const end=si===parts.length-1?wordEnd:c+(wordEnd-c)*syllableWeight(parts[si])/Math.max(1,sum);syllables.push({text:parts[si],begin:c,end,wordIndex:wi});c=end;}
-      wordCursor=wordEnd; if(wi<words.length-1)wordCursor=Math.min(lineEnd,wordCursor+Math.min(55,(lineEnd-lineStart)/Math.max(1,words.length*12)));
+  return lines.map((line,i)=>{
+    const lineStart=activeTimelineMap(cursor,intervals,durationMs);
+    cursor+=usableMs*weights[i]/totalWeight;
+    let lineEnd=activeTimelineMap(cursor,intervals,durationMs);
+    if(lineEnd<=lineStart)lineEnd=Math.min(durationMs,lineStart+80);
+    const words=splitWords(line); const syllables:SyllableUnit[]=[];
+    const entries=words.flatMap((word,wi)=>splitSyllables(word,lang).map(text=>({text,wordIndex:wi,weight:syllableWeight(text)})));
+    const sum=entries.reduce((n,x)=>n+x.weight,0)||1; let c=lineStart;
+    for(let j=0;j<entries.length;j++){
+      const x=entries[j]; const end=j===entries.length-1?lineEnd:c+(lineEnd-lineStart)*x.weight/sum;
+      syllables.push({text:x.text,begin:c,end:Math.max(c+1,end),wordIndex:x.wordIndex}); c=end;
     }
+    if(syllables.length)syllables[syllables.length-1].end=lineEnd;
     return {text:line,begin:lineStart,end:lineEnd,syllables};
   });
 }
