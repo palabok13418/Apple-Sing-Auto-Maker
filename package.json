@@ -1,1 +1,14 @@
-{"name":"apple-sing-ttml-forge","version":"0.1.0","private":true,"type":"module","scripts":{"build":"node scripts/prepare-dist.mjs","typecheck":"tsc --noEmit","dev":"python3 -m http.server 4173","test:embed":"node scripts/test-embed-integration.mjs"},"devDependencies":{"typescript":"^5.8.3"}}
+{
+  "name": "apple-sing-ttml-forge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/prepare-dist.mjs",
+    "typecheck": "tsc --noEmit",
+    "dev": "python3 -m http.server 4173"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}
