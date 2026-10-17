@@ -26,3 +26,8 @@ A separate, low-end-first project for generating Apple-Music-style Sing TTML fro
 The browser admission gate is a compact calibrated feature ensemble and is intentionally conservative, but it is not a substitute for a real labeled audio dataset. python/train_classifier.py now contains an actual offline trainer that learns a tiny standardized softmax classifier and weights the reject class more heavily. Train it on representative isolated lead stems, isolated backing stems, full mixes, instrumental-heavy files, noise and ambiguous cases before treating the classifier as production-grade.
 
 The TTML generator now derives its lyric-line structure from the pasted lyrics instead of inventing a fixed-length transcript. Audio timing is still signal-derived rather than a full neural forced-alignment model, so syllable timing is an informed local alignment pass, not a guarantee of phoneme-level accuracy.
+
+
+## Mus-API embedding
+
+The deployed Forge can run as a first-class Mus-API app from its own website. Mus-API opens the live Apple Sing TTML Forge website with the mus-api-embed=1 query parameter. The app acknowledges a versioned parent handshake before Mus-API reports the connection as ready. The deployment response headers allow the canonical Mus-API origin to embed it. The standalone site keeps its own header and footer; embedded mode uses Mus-API app chrome instead.
